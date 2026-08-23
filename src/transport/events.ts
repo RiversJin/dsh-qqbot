@@ -56,12 +56,19 @@ export interface TurnEndEvent {
   reason: TurnEndReason;
 }
 
+/** One model-free tool-result replacement recorded by the compaction layer. */
+export interface CompactionPruneEvent {
+  type: 'compaction/prune';
+  shadowedTokenCount: number;
+}
+
 /** 出站事件联合类型 */
 export type OutboundEvent =
   | ChunkEvent
   | MessageEvent
   | ToolCallEvent
   | ToolResultEvent
+  | CompactionPruneEvent
   | TurnEndEvent;
 
 /**
@@ -99,6 +106,12 @@ export function parseEvent(raw: RawSessionEvent): OutboundEvent | undefined {
     case 'turn/end': {
       const reason = (raw.data as { reason?: TurnEndReason }).reason ?? {};
       return { type: 'turn/end', reason };
+    }
+
+    case 'compaction/prune': {
+      const count = (raw.data as { shadowedTokenCount?: unknown }).shadowedTokenCount;
+      if (typeof count !== 'number' || !Number.isFinite(count) || count < 0) return undefined;
+      return { type: 'compaction/prune', shadowedTokenCount: count };
     }
 
     default:

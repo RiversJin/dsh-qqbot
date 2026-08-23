@@ -17,6 +17,7 @@ import {
   type MessageEvent,
   type ToolCallEvent,
   type ToolResultEvent,
+  type CompactionPruneEvent,
   type TurnEndEvent,
   type RawSessionEvent,
 } from './events.js';
@@ -47,6 +48,8 @@ const SILENT_TURN_ERROR_CODES = new Set(['STREAM_CLOSED']);
 class OutboundRouter {
   private readonly buffers = new Map<string, OutboundBuffer>();
   private readonly toolCalls = new Map<string, ToolCallRecord>();
+  private readonly prunedResults = new Map<string, number>();
+  private readonly deliveries = new Map<string, Promise<void>>();
 
   public constructor(
     private readonly manager: SessionManager,
@@ -72,10 +75,13 @@ class OutboundRouter {
         this.onMessage(session.header.id, record, event);
         break;
       case 'tool/call':
-        this.onToolCall(event);
+        this.onToolCall(session.header.id, record, event);
         break;
       case 'tool/result':
         this.onToolResult(record, event);
+        break;
+      case 'compaction/prune':
+        this.onCompactionPrune(session.header.id, event);
         break;
       case 'turn/end':
         this.onTurnEnd(session.header.id, record, event);
@@ -104,7 +110,7 @@ class OutboundRouter {
   private onMessage(sessionId: string, record: SessionRecord, event: MessageEvent): void {
     const buffer = this.buffers.get(sessionId);
     if (buffer !== undefined && buffer.text.trim()) {
-      void buffer.flush();
+      this.enqueueDelivery(sessionId, () => buffer.flush());
       this.buffers.delete(sessionId);
       return;
     }
@@ -116,13 +122,20 @@ class OutboundRouter {
     const fullText = textParts.join('\n');
     if (!fullText.trim()) return;
 
-    void this.send(record, fullText, 'sendMarkdown');
+    this.enqueueDelivery(sessionId, () => this.send(record, fullText, 'sendMarkdown'));
     this.buffers.delete(sessionId);
   }
 
-  /** 工具调用：仅记录，不发送（避免刷屏，等待结果） */
-  private onToolCall(event: ToolCallEvent): void {
+  /** 工具调用：记录调用；浏览器子代理额外发送一次轻量状态提示。 */
+  private onToolCall(sessionId: string, record: SessionRecord, event: ToolCallEvent): void {
     this.toolCalls.set(event.callId, { name: event.name, args: event.arguments });
+    if (event.name === 'browser_agent') {
+      this.enqueueDelivery(sessionId, () => this.send(
+        record,
+        '🌐 Luna 正在浏览网页…',
+        'sendBrowserAgentNotice',
+      ));
+    }
   }
 
   /** 工具结果：错误始终发送，成功结果按开关 */
@@ -142,7 +155,12 @@ class OutboundRouter {
     );
     if (!text) return;
 
-    void this.send(record, text, 'sendToolResult');
+    this.enqueueDelivery(record.sessionId, () => this.send(record, text, 'sendToolResult'));
+  }
+
+  /** Accumulate replacements and emit one unobtrusive user-facing notice at turn end. */
+  private onCompactionPrune(sessionId: string, _event: CompactionPruneEvent): void {
+    this.prunedResults.set(sessionId, (this.prunedResults.get(sessionId) ?? 0) + 1);
   }
 
   /** 轮次结束：清理 buffer，异常结束时告知用户 */
@@ -150,7 +168,7 @@ class OutboundRouter {
     const buffer = this.buffers.get(sessionId);
     if (buffer !== undefined) {
       if (buffer.text.trim()) {
-        void buffer.flush();
+        this.enqueueDelivery(sessionId, () => buffer.flush());
       } else {
         buffer.cancel();
       }
@@ -159,10 +177,32 @@ class OutboundRouter {
 
     const failure = extractTurnError(event.reason);
     if (failure !== undefined && !SILENT_TURN_ERROR_CODES.has(failure.code)) {
-      void this.send(record, `⚠️ 本轮异常结束\n\`${failure.code}\`: ${failure.message}`, 'sendTurnEndError');
+      this.enqueueDelivery(sessionId, () => this.send(record, `⚠️ 本轮异常结束\n\`${failure.code}\`: ${failure.message}`, 'sendTurnEndError'));
+    }
+
+    const pruned = this.prunedResults.get(sessionId) ?? 0;
+    this.prunedResults.delete(sessionId);
+    if (pruned > 0) {
+      this.enqueueDelivery(sessionId, () => this.send(
+        record,
+        `🧹 已整理较早的 ${pruned} 条工具输出，以减少上下文占用。`,
+        'sendCompactionPruneNotice',
+      ));
     }
 
     this.logger.debug(`im-qqbot: turn/end sessionId=${sessionId}`);
+  }
+
+  /** Serialize all final sends for one session so the maintenance notice follows the reply. */
+  private enqueueDelivery(sessionId: string, delivery: () => Promise<void>): void {
+    const previous = this.deliveries.get(sessionId) ?? Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(delivery)
+      .finally(() => {
+        if (this.deliveries.get(sessionId) === next) this.deliveries.delete(sessionId);
+      });
+    this.deliveries.set(sessionId, next);
   }
 
   /** 统一发送：切分 + 逐 chunk 发送 + 错误记录 */
