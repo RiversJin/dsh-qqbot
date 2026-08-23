@@ -1,7 +1,7 @@
 /**
  * /bot-help — 查看所有指令，按「通用能力 / QQBot 特有」分组展示
  *
- * 通用能力：对应底层 dsh agent 能力（new/compact/model/stop），无前缀
+ * 通用能力：对应底层 dsh agent 能力（new/sessions/switch/model/stop），无前缀
  * QQBot 特有：插件自身封装（bot-ping/bot-version/bot-status/bot-help），带 bot- 前缀
  */
 import type { CommandDeps, CategorizedCommand } from './types.js';

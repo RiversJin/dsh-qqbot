@@ -80,7 +80,8 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 | Command | Description |
 |------|------|
 | `/new` (aliases `/reset` `/clear`) | Start a new session (clear context) |
-| `/compact` | Compact session history (replace old records with a summary) |
+| `/sessions` (alias `/session-list`) | List recent selectable sessions with creation/fork time, title, and short ID |
+| `/switch <index-or-short-id>` (alias `/resume`) | Switch to and resume an existing session |
 | `/bot-retry` (alias `/bot-regenerate`) | Regenerate from a clean branch before the latest turn; requires `force` after tool use |
 | `/model` | View or switch model |
 | `/stop` | Abort the current generation |

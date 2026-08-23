@@ -5,16 +5,17 @@
  * commands/index.ts 模式：工厂函数注入依赖，统一导出命令列表。
  *
  * 命令按 category 分两类：
- *   - agent：底层 dsh agent 通用能力（new/compact/model/stop）
+ *   - agent：底层 dsh agent 通用能力（new/sessions/switch/model/stop）
  *   - qqbot：插件自身特有（ping/version/status/help）
  */
 import type { CommandDeps, CategorizedCommand } from './types.js';
-import { newCommand, compactCommand } from './session.js';
+import { newCommand } from './session.js';
 import { modelCommand } from './model.js';
 import { statusCommand } from './status.js';
 import { helpCommand } from './help.js';
 import { pingCommand, versionCommand, stopCommand } from './misc.js';
 import { retryCommand } from './retry.js';
+import { sessionsCommand, switchCommand } from './sessions.js';
 
 /**
  * 构建标准命令列表
@@ -24,7 +25,8 @@ export function buildCommandList(deps: CommandDeps): CategorizedCommand[] {
     // 通用能力（底层 agent）
     newCommand(deps),
     retryCommand(deps),
-    compactCommand(deps),
+    sessionsCommand(deps),
+    switchCommand(deps),
     modelCommand(deps),
     stopCommand(deps),
     // QQBot 特有

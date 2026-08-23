@@ -31,6 +31,11 @@ import type {
   SessionRecord,
   SessionStatus,
   TokenUsageStats,
+  SessionHeaderLike,
+  SessionPersistenceLike,
+  SelectableSession,
+  SessionListOutcome,
+  SwitchSessionOutcome,
   CompactionServiceLike,
   CompactOutcome,
   PermissionPresetsLike,
@@ -434,6 +439,157 @@ export class SessionManager {
     };
   }
 
+  /** List recent sessions belonging to this QQ peer's branch lineage. */
+  async listSessions(scope: ChatScope, peerId: string): Promise<SessionListOutcome> {
+    const key = this.sessionKey(scope, peerId);
+    const currentId = this.currentSessionId(key);
+    const roots = new Set([
+      ...this.modelResolver.getSessionHistory(key),
+      currentId,
+    ]);
+
+    let persistence: SessionPersistenceLike | undefined;
+    try {
+      persistence = this.ctx.get('sessionPersistence') as SessionPersistenceLike | undefined;
+    } catch {
+      // Reported below. Creation/fork timestamps are a required part of this UI.
+    }
+    if (!persistence) {
+      return { ok: false, reason: 'unavailable', sessions: [], message: '会话存储服务不可用' };
+    }
+
+    try {
+      const headers = await persistence.list();
+      const headerById = new Map(headers.map((header) => [String(header.id), header]));
+      const ordinarySessionIds = new Set(
+        headers
+          .filter((header) => (header.delegationDepth ?? 0) === 0)
+          .map((header) => String(header.id)),
+      );
+      let candidates = new Set(roots);
+
+      if (this.config.workspacePath) {
+        try {
+          const registry = this.ctx.get('workspaceRegistry') as WorkspaceRegistryLike | undefined;
+          const workspace = await registry?.resolveByPath(this.config.workspacePath);
+          if (workspace) {
+            const archived = new Set((registry?.archivedSessionIds ?? []).map(String));
+            candidates = new Set(workspace.sessionIds
+              .map(String)
+              .filter((id) => !archived.has(id) && ordinarySessionIds.has(id)));
+          }
+        } catch (error) {
+          this.logger.warn(`session list workspace lookup failed: key=${key} err=${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      candidates = new Set([...candidates].filter((id) => ordinarySessionIds.has(id)));
+
+      // Workspace membership alone is too broad for group deployments. A Web
+      // fork is selectable only when its parent chain reaches a branch already
+      // owned by this exact QQ peer.
+      const allowed = collectLineageSessionIds(headers, roots, candidates);
+      const limit = Math.max(1, Math.floor(Number(this.config.visibleSessionLimit) || 16));
+      const ordered = [...allowed]
+        .map((sessionId) => ({ sessionId, header: headerById.get(sessionId) }))
+        .sort((a, b) => (b.header?.createdAt ?? 0) - (a.header?.createdAt ?? 0))
+        .slice(0, limit);
+
+      const sessions = await Promise.all(ordered.map(async ({ sessionId, header }): Promise<SelectableSession> => {
+        let events = this.agents.get(sessionId)?.session.events;
+        if (!events) {
+          try {
+            events = (await persistence!.inspect(SessionId(sessionId))).events;
+          } catch (error) {
+            this.logger.debug(`session title unavailable: sessionId=${sessionId} err=${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        return {
+          sessionId,
+          ...(header?.createdAt !== undefined ? { createdAt: header.createdAt } : {}),
+          ...(header?.parentSession ? { parentSession: String(header.parentSession) } : {}),
+          ...(latestSessionTitle(events) ? { title: latestSessionTitle(events) } : {}),
+          current: sessionId === currentId,
+        };
+      }));
+
+      return { ok: true, sessions };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`session list failed: key=${key} err=${message}`);
+      return { ok: false, reason: 'failed', sessions: [], message };
+    }
+  }
+
+  /** Switch this QQ peer to one listed persisted branch and resume it. */
+  async switchSession(
+    scope: ChatScope,
+    peerId: string,
+    selector: string,
+    senderId: string,
+    replyTarget: ReplyTarget,
+  ): Promise<SwitchSessionOutcome> {
+    const key = this.sessionKey(scope, peerId);
+    const listed = await this.listSessions(scope, peerId);
+    if (!listed.ok) return { ok: false, reason: 'failed', message: listed.message };
+
+    const resolved = resolveSessionSelector(listed.sessions, selector);
+    if (resolved.kind === 'not-found') return { ok: false, reason: 'not-found' };
+    if (resolved.kind === 'ambiguous') {
+      return { ok: false, reason: 'ambiguous', matches: resolved.matches };
+    }
+    const target = resolved.session;
+    const previous = this.sessions.get(key);
+    if (previous?.agent.status === 'running') return { ok: false, reason: 'busy' };
+    if (previous?.sessionId === target.sessionId) {
+      previous.replyTarget = replyTarget;
+      previous.lastActivity = Date.now();
+      return { ok: true, session: { ...target, current: true } };
+    }
+
+    const targetId = SessionId(target.sessionId);
+    const composed = await this.composePreset(this.config.preset);
+    let createdHandle: DshAgentHandle | undefined;
+    try {
+      const live = this.agents.get(targetId);
+      const agent = live ?? (createdHandle = await this.agents.resume({
+        resumeSessionId: targetId,
+        ...(this.modelResolver.getResumeRoute(key) ? { agentOptions: this.modelResolver.getResumeRoute(key) } : {}),
+        ...(composed.setup ? { setup: composed.setup } : {}),
+      })).agent;
+
+      this.applyConfiguredPermission(agent);
+      await this.attachConfiguredWorkspace(agent);
+
+      const record: SessionRecord = {
+        sessionKey: key,
+        sessionId: targetId,
+        agent,
+        handle: createdHandle ?? { agent, dispose: async () => {} },
+        replyTarget,
+        scope,
+        peerId,
+        senderId,
+        lastActivity: Date.now(),
+        agentPreset: agent.session.header?.agentPreset ?? composed.agentPreset,
+      };
+
+      this.modelResolver.setSessionId(key, targetId);
+      this.sessions.set(key, record);
+      await this.rememberVisibleSessions(key, [targetId]);
+      if (previous && previous.agent !== agent) {
+        previous.agent.cancel({ kind: 'user' });
+        await previous.handle.dispose().catch(() => {});
+      }
+      this.logger.info(`session switched: key=${key} sessionId=${targetId}`);
+      return { ok: true, session: { ...target, current: true } };
+    } catch (error) {
+      await createdHandle?.dispose().catch(() => {});
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`session switch failed: key=${key} target=${targetId} err=${message}`);
+      return { ok: false, reason: 'failed', message };
+    }
+  }
+
   getTokenUsage(scope: ChatScope, peerId: string): TokenUsageStats {
     const record = this.getSessionRecord(scope, peerId);
     const stats: TokenUsageStats = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -717,6 +873,67 @@ interface RetryableTurn {
   endIndex: number;
   userEvent: SessionEventLike;
   toolCount: number;
+}
+
+/** Keep only workspace sessions descending from this peer's known roots. */
+export function collectLineageSessionIds(
+  headers: readonly SessionHeaderLike[],
+  roots: ReadonlySet<string>,
+  candidates: ReadonlySet<string>,
+): Set<string> {
+  const allowed = new Set([...roots].filter((id) => candidates.has(id)));
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const header of headers) {
+      const id = String(header.id);
+      const parent = header.parentSession ? String(header.parentSession) : undefined;
+      if (!candidates.has(id) || allowed.has(id) || !parent || !allowed.has(parent)) continue;
+      allowed.add(id);
+      changed = true;
+    }
+  }
+  return allowed;
+}
+
+type SelectorResolution =
+  | { kind: 'found'; session: SelectableSession }
+  | { kind: 'not-found' }
+  | { kind: 'ambiguous'; matches: SelectableSession[] };
+
+/** Resolve a one-based list index, full id, or unique displayed-id prefix. */
+export function resolveSessionSelector(
+  sessions: readonly SelectableSession[],
+  rawSelector: string,
+): SelectorResolution {
+  const selector = rawSelector.trim();
+  if (!selector) return { kind: 'not-found' };
+  if (/^[1-9]\d*$/.test(selector)) {
+    const selected = sessions[Number(selector) - 1];
+    return selected ? { kind: 'found', session: selected } : { kind: 'not-found' };
+  }
+
+  const normalized = selector.toLowerCase();
+  const matches = sessions.filter(({ sessionId }) => {
+    const id = sessionId.toLowerCase();
+    const displayId = id.startsWith('session-') ? id.slice('session-'.length) : id;
+    return id === normalized || id.startsWith(normalized) || displayId.startsWith(normalized);
+  });
+  if (matches.length === 1) return { kind: 'found', session: matches[0]! };
+  if (matches.length > 1) return { kind: 'ambiguous', matches };
+  return { kind: 'not-found' };
+}
+
+/** Last durable title wins; absent titles stay absent rather than inventing one. */
+function latestSessionTitle(events: readonly SessionEventLike[] | undefined): string | undefined {
+  if (!events) return undefined;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.type !== 'session/title') continue;
+    const title = event.data?.title;
+    if (typeof title === 'string' && title.trim()) return title.trim();
+  }
+  return undefined;
 }
 
 /** Locate the latest completed user turn and its clean fork boundary. */

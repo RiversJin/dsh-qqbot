@@ -34,6 +34,7 @@ export interface DshAgent {
   readonly session: {
     readonly id: string;
     readonly events?: readonly SessionEventLike[];
+    readonly header?: SessionHeaderLike;
   };
   cancel(cause: { kind: string }): void;
   followup(message: unknown): void;
@@ -76,6 +77,49 @@ export interface SessionsService {
   fork(source: unknown, boundary?: number): { events: readonly unknown[] };
 }
 
+/** Lightweight persisted session metadata used by QQ session selection. */
+export interface SessionHeaderLike {
+  id: string;
+  createdAt: number;
+  cwd?: string;
+  parentSession?: string;
+  agentPreset?: string;
+  delegationDepth?: number;
+}
+
+export interface SessionInspectionLike {
+  meta: SessionHeaderLike;
+  events: readonly SessionEventLike[];
+}
+
+export interface SessionPersistenceLike {
+  list(signal?: AbortSignal): Promise<SessionHeaderLike[]>;
+  inspect(sessionId: string, signal?: AbortSignal): Promise<SessionInspectionLike>;
+}
+
+export interface SelectableSession {
+  sessionId: string;
+  createdAt?: number;
+  title?: string;
+  parentSession?: string;
+  current: boolean;
+}
+
+export interface SessionListOutcome {
+  ok: boolean;
+  reason?: 'unavailable' | 'failed';
+  sessions: SelectableSession[];
+  message?: string;
+}
+
+export interface SwitchSessionOutcome {
+  ok: boolean;
+  reason?: 'not-found' | 'ambiguous' | 'busy' | 'failed';
+  session?: SelectableSession;
+  matches?: SelectableSession[];
+  message?: string;
+}
+
 export interface DshAgentRegistry {
   /** 获取进程内已存活的 agent */
   get(sessionId: string): DshAgent | undefined;
@@ -101,7 +145,11 @@ export interface PermissionPresetsLike {
 }
 
 export interface WorkspaceRegistryLike {
-  resolveByPath(path: string): Promise<{ attachSession(sessionId: string): Promise<void> } | undefined>;
+  readonly archivedSessionIds?: readonly string[];
+  resolveByPath(path: string): Promise<{
+    readonly sessionIds: readonly string[];
+    attachSession(sessionId: string): Promise<void>;
+  } | undefined>;
   archiveSession(sessionId: string): Promise<void>;
 }
 
