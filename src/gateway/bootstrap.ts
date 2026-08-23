@@ -84,6 +84,16 @@ export async function bootstrapGateway(
     console.log(`[im-qqbot] Bot ready! appId=${config.appId}`);
   });
 
+  bot.on('resumed', () => {
+    if (config.debug) console.log('[im-qqbot] Bot gateway session resumed');
+  });
+
+  bot.on('rawEvent', (eventCtx) => {
+    if (config.debug) {
+      console.log(`[im-qqbot] inbound raw gateway event: ${eventCtx.eventType}`);
+    }
+  });
+
   // ── 富媒体过期清理 ──
   if (config.media.enabled) {
     startMediaCleanup(ctx, config.media.ttlHours, logger);

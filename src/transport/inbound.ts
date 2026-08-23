@@ -135,9 +135,16 @@ export async function handleInbound(
   // Enforce permission and Workspace policy before persisting attachments.
   let record;
   try {
+    if (config.debug) console.log('[im-qqbot] inbound reached session manager');
     record = await manager.getOrCreate(scope, peerId, msg.senderId, replyTarget);
+    if (config.debug) console.log('[im-qqbot] inbound session ready');
   } catch (err) {
     logger.error(`ERROR creating session: ${err instanceof Error ? err.message : String(err)}`);
+    if (config.debug) {
+      console.error(
+        `[im-qqbot] inbound session setup failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     return;
   }
 
@@ -186,6 +193,7 @@ export async function handleInbound(
 
   record.agent.followup(message);
   logger.info(`→ followup sent: key=${scope}:${peerId}`);
+  if (config.debug) console.log('[im-qqbot] inbound followup dispatched');
 
   // 群消息回复后清空历史缓存（避免下次 @ 时重复组包，对齐 openclaw-qqbot dispatch）
   if (scope === 'group') {

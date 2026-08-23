@@ -35,6 +35,21 @@ export function setupMiddlewares(
   // 1. 错误兜底（最外层洋葱皮）
   bot.use(errorHandler());
 
+  // 调试探针必须位于过滤/门控之前，否则被访问策略或去重丢弃的消息
+  // 在日志里完全不可见。仅记录事件类型和会话种类，不记录正文或标识符。
+  if (config.debug) {
+    bot.use(async (mCtx, next) => {
+      console.log(
+        `[im-qqbot] inbound gateway message: event=${mCtx.message.rawEventType} kind=${mCtx.message.kind}`,
+      );
+      await next();
+      console.log(
+        `[im-qqbot] inbound middleware result: stopped=${mCtx.stopped}` +
+        (mCtx.stopReason ? ` reason=${mCtx.stopReason}` : ''),
+      );
+    });
+  }
+
   // 2. 消息过滤：bot 回声 + 消息去重
   bot.use(messageFilter({ skipSelfEcho: false }));
 
@@ -50,7 +65,7 @@ export function setupMiddlewares(
     },
     onBlock: (_mCtx, reason) => {
       if (config.debug) {
-        logger.debug(`Access blocked: ${reason}`);
+        console.warn(`[im-qqbot] inbound message blocked by access policy: ${reason}`);
       }
     },
   }));
