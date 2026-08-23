@@ -33,6 +33,12 @@ import type {
   TokenUsageStats,
   CompactionServiceLike,
   CompactOutcome,
+  PermissionPresetsLike,
+  WorkspaceRegistryLike,
+  ImageAttachmentLimitsLike,
+  AttachmentsLike,
+  NativeImageInput,
+  LlmResolverLike,
 } from './types.js';
 
 /** ManualCompactionError 各 code 的友好提示（对齐 command-compact 的 expectedFailure 语义） */
@@ -46,6 +52,7 @@ const COMPACTION_ERROR_HINTS: Record<string, string> = {
 
 export class SessionManager {
   private sessions = new Map<string, SessionRecord>();
+  private retentionTasks = new Map<string, Promise<void>>();
   private readonly evictor: IdleEvictor;
   private readonly modelResolver: ModelResolver;
 
@@ -78,6 +85,163 @@ export class SessionManager {
     } catch {
       return undefined;
     }
+  }
+
+  /** Enforce the connector-level permission policy on every QQ-owned session. */
+  private applyConfiguredPermission(agent: DshAgent): void {
+    const configured = this.config.permissionPreset;
+    if (!configured) return;
+
+    let presets: PermissionPresetsLike | undefined;
+    try {
+      presets = this.ctx.get('permissionPresets') as PermissionPresetsLike | undefined;
+    } catch {
+      // Handled by the explicit failure below.
+    }
+    if (!presets) {
+      throw new Error(`im-qqbot: permission preset ${configured} requested but permissionPresets service is unavailable`);
+    }
+
+    presets.set(agent.session, configured);
+    const effective = presets.current(agent.session.events);
+    if (effective !== configured) {
+      throw new Error(`im-qqbot: failed to persist permission preset ${configured}; effective=${effective}`);
+    }
+  }
+
+  /** Attach QQ-owned sessions to their configured DSH Workspace. */
+  private async attachConfiguredWorkspace(agent: DshAgent): Promise<void> {
+    const configured = this.config.workspacePath;
+    if (!configured) return;
+
+    let registry: WorkspaceRegistryLike | undefined;
+    try {
+      registry = this.ctx.get('workspaceRegistry') as WorkspaceRegistryLike | undefined;
+    } catch {
+      // Handled by the explicit failure below.
+    }
+    if (!registry) {
+      throw new Error(`im-qqbot: workspace ${configured} requested but workspaceRegistry service is unavailable`);
+    }
+
+    const workspace = await registry.resolveByPath(configured);
+    if (!workspace) {
+      throw new Error(`im-qqbot: configured workspace does not exist: ${configured}`);
+    }
+    await workspace.attachSession(agent.session.id);
+  }
+
+  getImageAttachmentLimits(): ImageAttachmentLimitsLike | undefined {
+    try {
+      return (this.ctx.get('attachments') as AttachmentsLike | undefined)?.imageLimits;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async persistImages(
+    scope: ChatScope,
+    peerId: string,
+    inputs: readonly NativeImageInput[],
+  ): Promise<readonly unknown[]> {
+    if (inputs.length === 0) return [];
+
+    const route = this.modelResolver.getEffectiveRoute(this.sessionKey(scope, peerId));
+    if (route) {
+      let llm: LlmResolverLike | undefined;
+      try {
+        llm = this.ctx.get('llm') as LlmResolverLike | undefined;
+      } catch {
+        // The model adapter remains the final capability boundary.
+      }
+      if (llm?.resolveModelInfo) {
+        const modelInfo = await llm.resolveModelInfo(route.provider, route.model);
+        if (modelInfo.inputModalities && !modelInfo.inputModalities.includes('image')) {
+          throw new Error(`model ${route.provider}/${route.model} does not support image input`);
+        }
+      }
+    }
+
+    let attachments: AttachmentsLike | undefined;
+    try {
+      attachments = this.ctx.get('attachments') as AttachmentsLike | undefined;
+    } catch {
+      // Handled below.
+    }
+    if (!attachments) throw new Error('DSH attachment service is unavailable');
+    return attachments.saveImages(inputs);
+  }
+
+  /** Serialize per-peer retention updates and archive branches beyond the limit. */
+  private async rememberVisibleSessions(
+    sessionKey: string,
+    sessionIds: readonly string[],
+    prune = true,
+  ): Promise<void> {
+    const previous = this.retentionTasks.get(sessionKey) ?? Promise.resolve();
+    const task = previous
+      .catch(() => {})
+      .then(() => this.updateVisibleSessions(sessionKey, sessionIds, prune));
+    this.retentionTasks.set(sessionKey, task);
+    try {
+      await task;
+    } finally {
+      if (this.retentionTasks.get(sessionKey) === task) {
+        this.retentionTasks.delete(sessionKey);
+      }
+    }
+  }
+
+  private async updateVisibleSessions(
+    sessionKey: string,
+    sessionIds: readonly string[],
+    prune: boolean,
+  ): Promise<void> {
+    const existing = this.modelResolver.getSessionHistory(sessionKey);
+    const ordered = [...existing];
+    for (const sessionId of sessionIds) {
+      const previous = ordered.indexOf(sessionId);
+      if (previous >= 0) ordered.splice(previous, 1);
+      ordered.push(sessionId);
+    }
+
+    const changed = ordered.length !== existing.length
+      || ordered.some((sessionId, index) => sessionId !== existing[index]);
+    if (changed) this.modelResolver.setSessionHistory(sessionKey, ordered);
+    if (!prune) return;
+
+    const configuredLimit = Number(this.config.visibleSessionLimit);
+    const limit = Number.isFinite(configuredLimit)
+      ? Math.max(1, Math.floor(configuredLimit))
+      : 16;
+    if (ordered.length <= limit) return;
+
+    let registry: WorkspaceRegistryLike | undefined;
+    try {
+      registry = this.ctx.get('workspaceRegistry') as WorkspaceRegistryLike | undefined;
+    } catch {
+      // Keep the full queue so pruning can be retried later.
+    }
+    if (!registry) {
+      this.logger.warn(`session retention deferred: workspaceRegistry unavailable key=${sessionKey}`);
+      return;
+    }
+
+    const overflow = ordered.slice(0, ordered.length - limit);
+    const failed: string[] = [];
+    for (const sessionId of overflow) {
+      try {
+        await registry.archiveSession(SessionId(sessionId));
+        this.logger.info(`archived old connector session: key=${sessionKey} sessionId=${sessionId}`);
+      } catch (err) {
+        failed.push(sessionId);
+        this.logger.warn(`failed to archive connector session: key=${sessionKey} sessionId=${sessionId} err=${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    this.modelResolver.setSessionHistory(sessionKey, [
+      ...failed,
+      ...ordered.slice(ordered.length - limit),
+    ]);
   }
 
   // ── 模型相关（委托给 ModelResolver） ──
@@ -120,6 +284,7 @@ export class SessionManager {
       return;
     }
 
+    const parentId = record.sessionId;
     const childId = SessionId(randomUUID());
 
     const composed = await this.composePreset(this.config.preset);
@@ -136,6 +301,9 @@ export class SessionManager {
       ...(composed.setup ? { setup: composed.setup } : {}),
     });
 
+    this.applyConfiguredPermission(created.agent);
+    await this.attachConfiguredWorkspace(created.agent);
+
     this.modelResolver.setSessionId(key, childId);
 
     const oldHandle = record.handle;
@@ -146,7 +314,89 @@ export class SessionManager {
     record.lastActivity = Date.now();
 
     void oldHandle.dispose().catch(() => {});
+    await this.rememberVisibleSessions(key, [parentId, childId]);
     this.logger.info(`model switched via fork: key=${key} → ${route.provider}/${route.model} sessionId=${childId}`);
+  }
+
+  /**
+   * Re-run the latest user turn from a clean branch. The original conversation
+   * is not mutated; the child is seeded before turn/start and receives the
+   * original user message again.
+   */
+  async regenerateLast(
+    scope: ChatScope,
+    peerId: string,
+    force = false,
+  ): Promise<{
+    ok: boolean;
+    reason?: 'no-session' | 'no-turn' | 'tool-risk';
+    toolCount?: number;
+    sessionId?: string;
+  }> {
+    const key = this.sessionKey(scope, peerId);
+    const record = this.sessions.get(key);
+    if (!record) return { ok: false, reason: 'no-session' };
+
+    await record.agent.whenIdle();
+    const sourceEvents = [...(record.agent.session.events ?? [])];
+    const retryable = findLastRetryableTurn(sourceEvents);
+    if (!retryable) return { ok: false, reason: 'no-turn' };
+    if (retryable.toolCount > 0 && !force) {
+      return { ok: false, reason: 'tool-risk', toolCount: retryable.toolCount };
+    }
+
+    const originalMessage = retryable.userEvent.data ?? retryable.userEvent.message;
+    if (!originalMessage) return { ok: false, reason: 'no-turn' };
+
+    const parentId = record.sessionId;
+    const childId = SessionId(randomUUID());
+    const seed = sourceEvents.slice(0, retryable.startIndex);
+    const route = this.modelResolver.getEffectiveRoute(key);
+    const composed = await this.composePreset(this.config.preset);
+    const created = await this.agents.create({
+      sessionId: childId,
+      seed,
+      meta: {
+        cwd: this.config.cwd || process.cwd(),
+        parentSession: parentId,
+        seedLength: seed.length,
+        ...(composed.agentPreset ? { agentPreset: composed.agentPreset } : {}),
+      },
+      ...(route ? { agentOptions: route } : {}),
+      ...(composed.setup ? { setup: composed.setup } : {}),
+    });
+
+    this.applyConfiguredPermission(created.agent);
+    await this.attachConfiguredWorkspace(created.agent);
+
+    // Keep the known-good parent visible until the replay produces an answer.
+    await this.rememberVisibleSessions(key, [parentId], false);
+    this.modelResolver.setSessionId(key, childId);
+
+    const oldHandle = record.handle;
+    record.sessionId = childId;
+    record.agent = created.agent;
+    record.handle = created;
+    record.agentPreset = composed.agentPreset;
+    record.lastActivity = Date.now();
+    void oldHandle.dispose().catch(() => {});
+
+    created.agent.followup(structuredClone(originalMessage));
+    void created.agent.whenIdle().then(async () => {
+      const generated = (created.agent.session.events ?? [])
+        .slice(seed.length)
+        .some((event) => event.type === 'assistant/message');
+      if (generated) {
+        await this.rememberVisibleSessions(key, [childId], true);
+      } else {
+        this.logger.warn(`clean retry ended without assistant message: key=${key} sessionId=${childId}`);
+      }
+    }).catch((err) => {
+      this.logger.warn(`clean retry completion check failed: key=${key} sessionId=${childId} err=${err instanceof Error ? err.message : String(err)}`);
+    });
+
+    this.logger.info(`clean retry forked: key=${key} parent=${parentId} sessionId=${childId} seedLength=${seed.length}`);
+    return { ok: true, sessionId: childId };
   }
 
   clearModelOverride(scope: ChatScope, peerId: string): void {
@@ -252,6 +502,11 @@ export class SessionManager {
     return this.modelResolver.getSessionId(sessionKey) ?? this.deriveSessionId(sessionKey);
   }
 
+  /** Stable timestamp/envelope identity for the peer's currently selected branch. */
+  getConversationSessionId(scope: ChatScope, peerId: string): string {
+    return this.currentSessionId(this.sessionKey(scope, peerId));
+  }
+
   private async composePreset(presetId?: string): Promise<PresetComposition> {
     let presets: AgentPresetsLike | undefined;
     try {
@@ -290,6 +545,9 @@ export class SessionManager {
     const existing = this.sessions.get(key);
 
     if (existing) {
+      this.applyConfiguredPermission(existing.agent);
+      await this.attachConfiguredWorkspace(existing.agent);
+      await this.rememberVisibleSessions(key, [existing.sessionId]);
       existing.replyTarget = replyTarget;
       existing.lastActivity = Date.now();
       return existing;
@@ -337,6 +595,9 @@ export class SessionManager {
       }
     }
 
+    this.applyConfiguredPermission(agent);
+    await this.attachConfiguredWorkspace(agent);
+
     const record: SessionRecord = {
       sessionKey: key,
       sessionId,
@@ -351,6 +612,7 @@ export class SessionManager {
     };
 
     this.sessions.set(key, record);
+    await this.rememberVisibleSessions(key, [sessionId]);
     return record;
   }
 
@@ -371,13 +633,18 @@ export class SessionManager {
   async remove(scope: ChatScope, peerId: string): Promise<void> {
     const key = this.sessionKey(scope, peerId);
     const record = this.sessions.get(key);
-    this.modelResolver.setSessionId(key, randomUUID());
+
+    // Persist a fresh id before the first await. A message arriving immediately
+    // after reset can no longer resume either the active fork or deterministic base.
+    const nextSessionId = SessionId(randomUUID());
+    this.modelResolver.setSessionId(key, nextSessionId);
 
     if (!record) return;
     this.sessions.delete(key);
+    await this.rememberVisibleSessions(key, [record.sessionId], false);
     record.agent.cancel({ kind: 'user' });
     await record.handle.dispose().catch(() => {});
-    this.logger.info(`session removed: key=${key}`);
+    this.logger.info(`session reset: key=${key} nextSessionId=${nextSessionId}`);
   }
 
   /**
@@ -443,6 +710,57 @@ export class SessionManager {
   get size(): number {
     return this.sessions.size;
   }
+}
+
+interface RetryableTurn {
+  startIndex: number;
+  endIndex: number;
+  userEvent: SessionEventLike;
+  toolCount: number;
+}
+
+/** Locate the latest completed user turn and its clean fork boundary. */
+export function findLastRetryableTurn(events: readonly SessionEventLike[]): RetryableTurn | undefined {
+  let endIndex = -1;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (events[index]?.type === 'turn/end') {
+      endIndex = index;
+      break;
+    }
+  }
+  if (endIndex < 0) return undefined;
+
+  const turnId = events[endIndex]?.data?.turn;
+  let startIndex = -1;
+  for (let index = endIndex; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.type === 'turn/start' && (turnId === undefined || event.data?.turn === turnId)) {
+      startIndex = index;
+      break;
+    }
+  }
+  if (startIndex < 0) return undefined;
+
+  let userEvent: SessionEventLike | undefined;
+  let toolCount = 0;
+  let sawToolEvent = false;
+  for (let index = startIndex; index <= endIndex; index += 1) {
+    const event = events[index];
+    if (event?.type === 'tool/call') toolCount += 1;
+    if (event?.type === 'tool/call' || event?.type === 'tool/result') sawToolEvent = true;
+    if (event?.type !== 'user/message') continue;
+    const message = event.data ?? event.message;
+    const source = (message as { source?: { kind?: string } } | undefined)?.source;
+    if (source?.kind === 'user') userEvent = event;
+  }
+  if (!userEvent) return undefined;
+
+  return {
+    startIndex,
+    endIndex,
+    userEvent,
+    toolCount: Math.max(toolCount, sawToolEvent ? 1 : 0),
+  };
 }
 
 /** 从消息对象中提取纯文本（用于导出/统计） */

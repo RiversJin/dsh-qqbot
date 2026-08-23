@@ -15,11 +15,26 @@ import type { ImQQBotConfig } from '../config.js';
 import type { ChatScope, Logger, QuotedAttachment, RawAttachment, ReplyTarget } from '../types.js';
 import {
   classifyContentType,
+  isImageAttachment,
   isVoiceContentType,
   type DownloadedFile,
+  type DownloadedImage,
   type MediaKind,
 } from './attachment.js';
 import { clearGroupHistory } from '../features/history-store.js';
+
+interface TimestampState {
+  epochMs: number;
+  dayKey: string;
+}
+
+interface TimestampPolicy {
+  key: string;
+  timeZone: string;
+  intervalMs: number;
+}
+
+const lastTimestampByConversation = new Map<string, TimestampState>();
 
 // ── 类型定义 ──
 
@@ -30,7 +45,7 @@ interface ProcessedMessage {
   senderName?: string;
   content: string;
   messageId: string;
-  timestamp: string;
+  timestamp: string | number;
   groupOpenid?: string;
   msgType?: number;
   attachments?: RawAttachment[];
@@ -39,7 +54,7 @@ interface ProcessedMessage {
 
 interface ResolvedQuote {
   text?: string;
-  entry?: { senderId?: string; content?: string };
+  entry?: { senderId?: string; content?: string; timestamp?: string | number };
   attachments?: QuotedAttachment[];
 }
 
@@ -62,6 +77,7 @@ interface MiddlewareState {
   mention?: MentionState;
   processedAttachments?: ProcessedAttachment[];
   downloadedFiles?: DownloadedFile[];
+  downloadedImages?: DownloadedImage[];
   downloadedQuoteFiles?: DownloadedFile[];
   [key: string]: unknown;
 }
@@ -103,14 +119,20 @@ export async function handleInbound(
     msgId: msg.messageId,
   };
 
-  // ── 组装 agentBody（下载结果经 mwState.downloadedFiles 提供） ──
-  const agentBody = assembleAgentBody(msg, mwState, scope, logger);
+  const timestampPolicy: TimestampPolicy = {
+    key: `${config.appId}:${manager.getConversationSessionId(scope, peerId)}`,
+    timeZone: config.timestampTimeZone || 'Asia/Singapore',
+    intervalMs: Math.max(1, Number(config.timestampIntervalMinutes) || 30) * 60 * 1000,
+  };
 
-  if (!agentBody) return;
+  const wasMentioned = mwState.mention?.wasMentioned ?? false;
+  if (
+    !(msg.content ?? '').trim()
+    && (!msg.attachments || msg.attachments.length === 0)
+    && !(scope === 'group' && wasMentioned)
+  ) return;
 
-  logger.info(`Processing: scope=${scope} peerId=${peerId} body="${agentBody.slice(0, 200)}"`);
-
-  // ── 获取或创建会话 ──
+  // Enforce permission and Workspace policy before persisting attachments.
   let record;
   try {
     record = await manager.getOrCreate(scope, peerId, msg.senderId, replyTarget);
@@ -119,8 +141,43 @@ export async function handleInbound(
     return;
   }
 
+  // ── 组装 agentBody（下载结果经 mwState.downloadedFiles 提供） ──
+  const downloadedImages = mwState.downloadedImages ?? [];
+  let imageRefs: readonly unknown[] = [];
+  let nativeImageIndexes = new Set<number>();
+
+  if (downloadedImages.length > 0) {
+    try {
+      imageRefs = await manager.persistImages(
+        scope,
+        peerId,
+        downloadedImages.map(image => image.input),
+      );
+      nativeImageIndexes = new Set(downloadedImages.map(image => image.sourceIndex));
+      logger.info(`im-qqbot: persisted ${imageRefs.length} native image(s): scope=${scope}`);
+    } catch (err) {
+      logger.warn(`im-qqbot: native image admission failed; falling back to text metadata: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  const agentBody = assembleAgentBody(
+    msg,
+    mwState,
+    scope,
+    logger,
+    timestampPolicy,
+    nativeImageIndexes,
+  );
+
+  if (!agentBody && imageRefs.length === 0) return;
+
+  logger.info(`Processing: scope=${scope} peerId=${peerId} body="${(agentBody ?? '').slice(0, 200)}" nativeImages=${imageRefs.length}`);
+
   // ── 构建 UserMessage → followup ──
-  const content: ContentBlock[] = [{ type: 'text' as const, text: agentBody }];
+  const content: ContentBlock[] = [
+    ...(agentBody ? [{ type: 'text' as const, text: agentBody }] : []),
+    ...imageRefs.map(attachment => ({ type: 'image', attachment }) as ContentBlock),
+  ];
 
   const message = createUserMessage({
     content,
@@ -148,6 +205,8 @@ function assembleAgentBody(
   state: MiddlewareState,
   scope: ChatScope,
   logger: Logger,
+  timestampPolicy: TimestampPolicy,
+  nativeImageIndexes: ReadonlySet<number> = new Set(),
 ): string | null {
   const isGroup = scope === 'group';
   const wasMentioned = state.mention?.wasMentioned ?? false;
@@ -156,13 +215,22 @@ function assembleAgentBody(
 
   if (isEmptyMessage(userContent, msg.attachments, isGroup, wasMentioned)) return null;
 
-  const quotePart = buildQuotePart(state.quote);
-  const userMessage = buildUserMessage(userContent, quotePart, msg.senderId, msg.senderName, isGroup, wasMentioned);
+  const quotePart = buildQuotePart(state.quote, timestampPolicy.timeZone);
+  const currentTimestamp = selectCurrentTimestamp(msg.timestamp, timestampPolicy);
+  const userMessage = buildUserMessage(
+    userContent,
+    quotePart,
+    msg.senderId,
+    msg.senderName,
+    isGroup,
+    wasMentioned,
+    currentTimestamp,
+  );
 
-  const dynamicCtx = buildDynamicCtx(msg, state);
+  const dynamicCtx = buildDynamicCtx(msg, state, nativeImageIndexes);
 
   const base = dynamicCtx ? `${dynamicCtx}${userMessage}` : userMessage;
-  const agentBody = buildAgentBody(base, state.history, isGroup, wasMentioned);
+  const agentBody = buildAgentBody(base, state.history, isGroup, wasMentioned, timestampPolicy);
 
   return agentBody;
 }
@@ -214,12 +282,14 @@ function buildUserContent(msg: ProcessedMessage, state: MiddlewareState, logger:
 /**
  * Layer 2: 引用消息块
  */
-function buildQuotePart(quote?: ResolvedQuote): string {
+function buildQuotePart(quote: ResolvedQuote | undefined, timeZone: string): string {
   if (!quote?.text && !quote?.entry?.content) return '';
 
   const quoteText = quote.text || quote.entry?.content || 'Original content unavailable';
+  const timestamp = formatMessageTimestamp(quote.entry?.timestamp, timeZone, true);
+  const prefix = timestamp ? `${timestamp} ` : '';
 
-  return `[Quoted message begins]\n${quoteText}\n[Quoted message ends]\n[Current message]\n`;
+  return `[Quoted message begins]\n${prefix}${quoteText}\n[Quoted message ends]\n[Current message]\n`;
 }
 
 /**
@@ -232,36 +302,49 @@ function buildUserMessage(
   senderName: string | undefined,
   isGroup: boolean,
   wasMentioned: boolean,
+  timestamp: string,
 ): string {
+  const timeTag = timestamp ? `${timestamp} ` : '';
   if (!isGroup) {
-    return `${quotePart}${userContent}`;
+    return `${quotePart}${timeTag}${userContent}`;
   }
 
   const mentionTag = wasMentioned ? ' (@you)' : '';
   const displayName = senderName ?? shortSenderId(senderId);
   const senderTag = `[${displayName} (${senderId})]`;
-  return `${quotePart}${senderTag} ${userContent}${mentionTag}`;
+  return `${quotePart}${timeTag}${senderTag} ${userContent}${mentionTag}`;
 }
 
 /**
  * Layer 4: 媒体元数据上下文（图片/视频/文件本地路径 + 语音 ASR + 引用附件）
  */
-function buildDynamicCtx(msg: ProcessedMessage, state: MiddlewareState): string {
+function buildDynamicCtx(
+  msg: ProcessedMessage,
+  state: MiddlewareState,
+  nativeImageIndexes: ReadonlySet<number>,
+): string {
   const lines: string[] = [];
 
   if (msg.attachments && msg.attachments.length > 0) {
-    const downloadedByFilename = new Map((state.downloadedFiles ?? []).map(d => [d.filename, d]));
+    const downloadedBySourceIndex = new Map((state.downloadedFiles ?? []).map(d => [d.sourceIndex, d]));
     const voices: RawAttachment[] = [];
 
     // 一次遍历归类 + 生成媒体行
-    for (const att of msg.attachments) {
-      const kind = classifyContentType(att.content_type);
+    for (const [sourceIndex, att] of msg.attachments.entries()) {
+      const kind = isImageAttachment(att) ? 'image' : classifyContentType(att.content_type);
       if (kind === 'voice') {
         voices.push(att);
         continue;
       }
-      const d = downloadedByFilename.get(att.filename);
-      lines.push(`- ${renderMediaLine(kind, att.filename, d?.localPath, att.url, att.size)}`);
+      const d = downloadedBySourceIndex.get(sourceIndex);
+      lines.push(`- ${renderMediaLine(
+        kind,
+        att.filename,
+        d?.localPath,
+        att.url,
+        att.size,
+        nativeImageIndexes.has(sourceIndex),
+      )}`);
     }
 
     // 语音：有 ASR 文本才带文本，否则只带链接（纯文本模型无法消费音频）
@@ -305,9 +388,15 @@ function renderMediaLine(
   localPath: string | undefined,
   url: string | undefined,
   size: number | undefined,
+  native = false,
 ): string {
   switch (kind) {
     case 'image':
+      if (native) {
+        return localPath
+          ? `Image: attached as native visual input (local copy: ${localPath})`
+          : 'Image: attached as native visual input';
+      }
       return localPath
         ? `Image: ${localPath}`
         : `Image: ${url ?? filename ?? 'image'}`;
@@ -330,14 +419,27 @@ function buildAgentBody(
   history: HistoryEntry[] | undefined,
   isGroup: boolean,
   wasMentioned: boolean,
+  timestampPolicy: TimestampPolicy,
 ): string {
   if (!isGroup || !wasMentioned || !history || history.length === 0) {
     return base;
   }
 
+  let previousTimestamp: TimestampState | undefined;
   const historyLines = history.map(h => {
     const name = h.senderName ?? shortSenderId(h.senderId);
-    return `[${name} (${h.senderId})] ${h.content}`;
+    const epochMs = parseMessageTimestamp(h.timestamp);
+    const dayKey = epochMs === undefined ? '' : formatDayKey(epochMs, timestampPolicy.timeZone);
+    const crossedDay = previousTimestamp !== undefined && previousTimestamp.dayKey !== dayKey;
+    const due = previousTimestamp === undefined
+      || crossedDay
+      || (epochMs !== undefined && epochMs - previousTimestamp.epochMs >= timestampPolicy.intervalMs);
+    const timestamp = due && epochMs !== undefined
+      ? formatMessageTimestamp(epochMs, timestampPolicy.timeZone, previousTimestamp === undefined || crossedDay)
+      : '';
+    if (due && epochMs !== undefined) previousTimestamp = { epochMs, dayKey };
+    const prefix = timestamp ? `${timestamp} ` : '';
+    return `${prefix}[${name} (${h.senderId})] ${h.content}`;
   });
 
   return [
@@ -348,6 +450,66 @@ function buildAgentBody(
     '[Current message]',
     base,
   ].join('\n');
+}
+
+/** Emit timestamps sparsely: first message, interval elapsed, or day change. */
+export function selectCurrentTimestamp(value: unknown, policy: TimestampPolicy): string {
+  const epochMs = parseMessageTimestamp(value);
+  if (epochMs === undefined) return '';
+  const dayKey = formatDayKey(epochMs, policy.timeZone);
+  const previous = lastTimestampByConversation.get(policy.key);
+  const crossedDay = previous !== undefined && previous.dayKey !== dayKey;
+  const due = previous === undefined || crossedDay || epochMs - previous.epochMs >= policy.intervalMs;
+  if (!due) return '';
+  lastTimestampByConversation.set(policy.key, { epochMs, dayKey });
+  return formatMessageTimestamp(epochMs, policy.timeZone, previous === undefined || crossedDay);
+}
+
+export function parseMessageTimestamp(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  let epochMs: number;
+  if (typeof value === 'number') {
+    epochMs = value < 1_000_000_000_000 ? value * 1000 : value;
+  } else if (typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value)) {
+    const numeric = Number(value);
+    epochMs = numeric < 1_000_000_000_000 ? numeric * 1000 : numeric;
+  } else if (typeof value === 'string') {
+    epochMs = Date.parse(value);
+  } else {
+    return undefined;
+  }
+  return Number.isFinite(epochMs) ? epochMs : undefined;
+}
+
+function formatDayKey(epochMs: number, timeZone: string): string {
+  return formatDateParts(epochMs, timeZone).dayKey;
+}
+
+export function formatMessageTimestamp(value: unknown, timeZone: string, includeDate: boolean): string {
+  const epochMs = parseMessageTimestamp(value);
+  if (epochMs === undefined) return '';
+  try {
+    const values = formatDateParts(epochMs, timeZone);
+    return includeDate
+      ? `[${values.month}-${values.day} ${values.hour}:${values.minute}]`
+      : `[${values.hour}:${values.minute}]`;
+  } catch {
+    return '';
+  }
+}
+
+function formatDateParts(epochMs: number, timeZone: string): Record<string, string> & { dayKey: string } {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(new Date(epochMs));
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value])) as Record<string, string>;
+  return { ...values, dayKey: `${values.year}-${values.month}-${values.day}` };
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -410,7 +572,7 @@ function buildAttachmentTags(attachments?: RawAttachment[]): string {
   const tags: string[] = [];
 
   for (const att of attachments) {
-    const kind = classifyContentType(att.content_type);
+    const kind = isImageAttachment(att) ? 'image' : classifyContentType(att.content_type);
     if (kind === 'voice' || seen.has(kind)) continue;
     seen.add(kind);
     const label = labels[kind];

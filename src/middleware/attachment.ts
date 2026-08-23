@@ -5,11 +5,12 @@
  * 下载失败不阻断消息（记录告警后放行），确保附件异常不影响正常文本处理。
  */
 import type { MiddlewareContext } from '@tencent-connect/qqbot-nodejs';
-import { downloadMediaAttachments } from '../transport/attachment.js';
+import { downloadMediaAttachments, prepareNativeImages } from '../transport/attachment.js';
 import type { ImQQBotConfig } from '../config.js';
 import type { Logger, QuotedAttachment, RawAttachment } from '../types.js';
+import type { SessionManager } from '../session/index.js';
 
-export function attachmentProcessor(config: ImQQBotConfig, logger: Logger) {
+export function attachmentProcessor(config: ImQQBotConfig, manager: SessionManager, logger: Logger) {
   return async (ctx: MiddlewareContext, next: () => Promise<void>): Promise<void> => {
     const msg = ctx.message as { attachments?: RawAttachment[] };
 
@@ -17,6 +18,10 @@ export function attachmentProcessor(config: ImQQBotConfig, logger: Logger) {
       // 当前消息附件
       const downloaded = await downloadMediaAttachments(msg.attachments, config.media, logger);
       ctx.state.downloadedFiles = downloaded;
+      const imageLimits = manager.getImageAttachmentLimits();
+      ctx.state.downloadedImages = imageLimits
+        ? prepareNativeImages(msg.attachments, downloaded, imageLimits, logger)
+        : [];
 
       // 引用消息附件：转成 RawAttachment 结构复用下载（voice 由 downloadMediaAttachments 自动跳过）
       const quoteAttachments = (ctx.state as { quote?: { attachments?: QuotedAttachment[] } }).quote?.attachments;

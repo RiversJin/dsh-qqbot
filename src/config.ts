@@ -51,6 +51,16 @@ export interface ImQQBotConfig {
   model?: string;
   /** Agent preset id */
   preset?: string;
+  /** QQ 会话强制使用的权限预设 */
+  permissionPreset?: string;
+  /** QQ 会话所属的 DSH Workspace 路径 */
+  workspacePath?: string;
+  /** 注入消息时间戳所使用的 IANA 时区 */
+  timestampTimeZone: string;
+  /** 模型可见时间戳的最短间隔（分钟） */
+  timestampIntervalMinutes: number;
+  /** 每个 QQ peer 在 DSH 中保留的可见会话分支数 */
+  visibleSessionLimit: number;
   /** Agent 工作目录（缺省回落到进程 cwd） */
   cwd?: string;
   /** 是否启用群消息 @mention 门控 */
@@ -89,6 +99,11 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
   provider: Schema.string().description('LLM provider name'),
   model: Schema.string().description('Model name'),
   preset: Schema.string().description('Agent preset id'),
+  permissionPreset: Schema.string().description('Permission preset forced onto QQ sessions'),
+  workspacePath: Schema.string().description('Workspace path that owns QQ sessions'),
+  timestampTimeZone: Schema.string().default('Asia/Singapore').description('IANA time zone used for message timestamps'),
+  timestampIntervalMinutes: Schema.number().default(30).description('Minimum interval between model-visible message timestamps'),
+  visibleSessionLimit: Schema.number().default(16).description('Maximum visible connector sessions retained per peer'),
   cwd: Schema.string().description('Agent working directory'),
   requireMention: Schema.boolean().default(true).description('群聊是否需要@bot触发'),
   groupPrompt: Schema.string().description('群聊额外system prompt'),

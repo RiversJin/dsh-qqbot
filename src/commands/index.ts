@@ -14,6 +14,7 @@ import { modelCommand } from './model.js';
 import { statusCommand } from './status.js';
 import { helpCommand } from './help.js';
 import { pingCommand, versionCommand, stopCommand } from './misc.js';
+import { retryCommand } from './retry.js';
 
 /**
  * 构建标准命令列表
@@ -22,6 +23,7 @@ export function buildCommandList(deps: CommandDeps): CategorizedCommand[] {
   const commands: CategorizedCommand[] = [
     // 通用能力（底层 agent）
     newCommand(deps),
+    retryCommand(deps),
     compactCommand(deps),
     modelCommand(deps),
     stopCommand(deps),

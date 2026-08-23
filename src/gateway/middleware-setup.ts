@@ -107,7 +107,7 @@ export function setupMiddlewares(
   }));
 
   // 11.5. 附件下载（file 附件下载到本地，供 @提及 / 工具访问）
-  bot.use(attachmentProcessor(config, logger));
+  bot.use(attachmentProcessor(config, manager, logger));
 
   // 12. 上下文组装（将 history + quote + sender 组成 envelope）
   bot.use(envelopeFormatter({

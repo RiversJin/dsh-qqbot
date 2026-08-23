@@ -17,6 +17,8 @@ interface PrefsFile {
   overrides: Record<string, ModelRoute>;
   /** sessionKey → 最新 sessionId（fork 后更新，用于重启后恢复到 fork 后的会话） */
   sessionIds: Record<string, string>;
+  /** sessionKey → connector 创建的会话分支（oldest → newest） */
+  sessionHistories?: Record<string, string[]>;
 }
 
 export class PrefsStore {
@@ -24,6 +26,8 @@ export class PrefsStore {
   private overrides = new Map<string, ModelRoute>();
   /** per-peer 最新 sessionId（fork 后更新，内存态） */
   private sessionIds = new Map<string, string>();
+  /** per-peer connector session history（oldest → newest） */
+  private sessionHistories = new Map<string, string[]>();
   /** 隔离偏好文件路径 */
   private readonly prefsPath: string;
   private readonly debugLog?: DebugFn;
@@ -72,6 +76,15 @@ export class PrefsStore {
     return deleted;
   }
 
+  getSessionHistory(sessionKey: string): string[] {
+    return [...(this.sessionHistories.get(sessionKey) ?? [])];
+  }
+
+  setSessionHistory(sessionKey: string, sessionIds: readonly string[]): void {
+    this.sessionHistories.set(sessionKey, [...sessionIds]);
+    this.write();
+  }
+
   // ── 私有方法 ──
 
   private load(): void {
@@ -93,6 +106,15 @@ export class PrefsStore {
           }
         }
       }
+      if (data.sessionHistories && typeof data.sessionHistories === 'object') {
+        for (const [key, sessionIds] of Object.entries(data.sessionHistories)) {
+          if (!Array.isArray(sessionIds)) continue;
+          const valid = sessionIds.filter((id): id is string => typeof id === 'string' && id.length > 0);
+          if (valid.length > 0) {
+            this.sessionHistories.set(key, [...new Set(valid)]);
+          }
+        }
+      }
     } catch (err) {
       this.debugLog?.(`loadPrefs failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -104,6 +126,7 @@ export class PrefsStore {
       const data: PrefsFile = {
         overrides: Object.fromEntries(this.overrides.entries()),
         sessionIds: Object.fromEntries(this.sessionIds.entries()),
+        sessionHistories: Object.fromEntries(this.sessionHistories.entries()),
       };
       writeFileSync(this.prefsPath, JSON.stringify(data, null, 2), 'utf8');
     } catch (err) {

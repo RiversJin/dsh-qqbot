@@ -62,6 +62,11 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 | `provider` | string | `deepseek-official` | LLM provider name |
 | `model` | string | `deepseek-chat` | Model name |
 | `preset` | string | - | Agent preset id |
+| `permissionPreset` | string | - | DSH permission preset enforced for QQ sessions |
+| `workspacePath` | string | - | DSH Workspace path that owns QQ sessions |
+| `timestampTimeZone` | string | `Asia/Singapore` | IANA time zone for model-visible message timestamps |
+| `timestampIntervalMinutes` | number | `30` | Minimum timestamp interval; day changes always emit one |
+| `visibleSessionLimit` | number | `16` | Visible session branches retained per QQ peer |
 | `cwd` | string | `process.cwd()` | Agent working directory |
 | `requireMention` | boolean | `true` | Whether group messages require @bot to trigger |
 | `groupPrompt` | string | - | Extra system prompt for group chats |
@@ -76,6 +81,7 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 |------|------|
 | `/new` (aliases `/reset` `/clear`) | Start a new session (clear context) |
 | `/compact` | Compact session history (replace old records with a summary) |
+| `/bot-retry` (alias `/bot-regenerate`) | Regenerate from a clean branch before the latest turn; requires `force` after tool use |
 | `/model` | View or switch model |
 | `/stop` | Abort the current generation |
 | `/bot-ping` | Connectivity test |

@@ -114,6 +114,14 @@ export class ModelResolver {
     this.prefs.clearSessionId(sessionKey);
   }
 
+  getSessionHistory(sessionKey: string): string[] {
+    return this.prefs.getSessionHistory(sessionKey);
+  }
+
+  setSessionHistory(sessionKey: string, sessionIds: readonly string[]): void {
+    this.prefs.setSessionHistory(sessionKey, sessionIds);
+  }
+
   /**
    * 解析默认模型路由（不含 per-peer 偏好）
    *

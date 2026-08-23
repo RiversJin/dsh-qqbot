@@ -16,6 +16,11 @@ export interface SessionEventLike {
     content?: Array<{ type: string; text?: string }>;
     [key: string]: unknown;
   };
+  data?: {
+    source?: { kind?: string };
+    turn?: unknown;
+    [key: string]: unknown;
+  };
   [key: string]: unknown;
 }
 
@@ -88,6 +93,42 @@ export interface DshAgentRegistry {
     agentOptions?: { provider?: string; model?: string };
     setup?: AgentSetup;
   }): Promise<DshAgentHandle>;
+}
+
+export interface PermissionPresetsLike {
+  set(session: unknown, preset: string): void;
+  current(events?: readonly SessionEventLike[]): string | undefined;
+}
+
+export interface WorkspaceRegistryLike {
+  resolveByPath(path: string): Promise<{ attachSession(sessionId: string): Promise<void> } | undefined>;
+  archiveSession(sessionId: string): Promise<void>;
+}
+
+export interface ImageAttachmentLimitsLike {
+  maxImageBytes: number;
+  maxImagesPerMessage: number;
+  maxMessageImageBytes: number;
+  mediaTypes: readonly string[];
+}
+
+export interface AttachmentsLike {
+  readonly imageLimits: ImageAttachmentLimitsLike;
+  saveImages(inputs: readonly NativeImageInput[]): Promise<readonly unknown[]>;
+}
+
+export interface NativeImageInput {
+  data: Uint8Array;
+  mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif';
+  name?: string;
+}
+
+export interface LlmModelInfoLike {
+  inputModalities?: readonly string[];
+}
+
+export interface LlmResolverLike {
+  resolveModelInfo(provider: string, model: string): Promise<LlmModelInfoLike>;
 }
 
 /** agent-presets 服务接口（可选，部署中可能没有） */

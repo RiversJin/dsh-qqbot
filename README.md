@@ -62,6 +62,11 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 | `provider` | string | `deepseek-official` | LLM 提供商名称 |
 | `model` | string | `deepseek-chat` | 模型名称 |
 | `preset` | string | - | Agent preset id |
+| `permissionPreset` | string | - | QQ 会话强制使用的 DSH 权限预设 |
+| `workspacePath` | string | - | QQ 会话所属的 DSH Workspace 路径 |
+| `timestampTimeZone` | string | `Asia/Singapore` | 模型可见消息时间戳使用的 IANA 时区 |
+| `timestampIntervalMinutes` | number | `30` | 时间戳最短注入间隔；跨天时总会注入 |
+| `visibleSessionLimit` | number | `16` | 每个 QQ peer 保留的可见会话分支数 |
 | `cwd` | string | `process.cwd()` | Agent 工作目录 |
 | `requireMention` | boolean | `true` | 群聊是否需要 @bot 才触发 |
 | `groupPrompt` | string | - | 群聊额外 system prompt |
@@ -76,6 +81,7 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 |------|------|
 | `/new`（别名 `/reset` `/clear`） | 开始新会话（清空上下文） |
 | `/compact` | 压缩会话历史（摘要替换旧记录，保留上下文） |
+| `/bot-retry`（别名 `/bot-regenerate`） | 从上一轮之前创建干净分支并重新生成；执行过工具时需加 `force` |
 | `/model` | 查看或切换模型 |
 | `/stop` | 中止当前生成 |
 | `/bot-ping` | 连通性测试 |
