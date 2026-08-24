@@ -435,6 +435,7 @@ export class SessionManager {
       model: route?.model,
       preset: record?.agentPreset,
       lastActivity: record?.lastActivity,
+      lastMessageAt: lastConversationMessageAt(record?.agent.session.events),
       messageCount: this.countMessages(record),
     };
   }
@@ -932,6 +933,20 @@ function latestSessionTitle(events: readonly SessionEventLike[] | undefined): st
     if (event?.type !== 'session/title') continue;
     const title = event.data?.title;
     if (typeof title === 'string' && title.trim()) return title.trim();
+  }
+  return undefined;
+}
+
+/** Latest real user/assistant message, excluding plugin-generated context rows. */
+export function lastConversationMessageAt(
+  events: readonly SessionEventLike[] | undefined,
+): number | undefined {
+  if (!events) return undefined;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!event || !Number.isFinite(event.time)) continue;
+    if (event.type === 'assistant/message') return event.time;
+    if (event.type === 'user/message' && event.data?.source?.kind === 'user') return event.time;
   }
   return undefined;
 }

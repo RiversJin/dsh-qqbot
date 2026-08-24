@@ -11,6 +11,7 @@ export type AgentSetup = (agentCtx: Context) => Promise<void> | void;
 export interface SessionEventLike {
   type: string;
   seq?: number;
+  time?: number;
   usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
   message?: {
     content?: Array<{ type: string; text?: string }>;
@@ -216,6 +217,7 @@ export interface SessionStatus {
   model?: string;
   preset?: string;
   lastActivity?: number;
+  lastMessageAt?: number;
   messageCount?: number;
 }
 

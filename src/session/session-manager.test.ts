@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   collectLineageSessionIds,
   findLastRetryableTurn,
+  lastConversationMessageAt,
   resolveSessionSelector,
 } from './session-manager.js';
 import type { SelectableSession, SessionEventLike, SessionHeaderLike } from './types.js';
@@ -39,6 +40,18 @@ describe('findLastRetryableTurn', () => {
     ];
 
     expect(findLastRetryableTurn(events)?.userEvent.data?.content).toBe('completed');
+  });
+});
+
+describe('lastConversationMessageAt', () => {
+  it('ignores plugin context messages after the latest real conversation message', () => {
+    const events: SessionEventLike[] = [
+      { type: 'user/message', time: 100, data: { source: { kind: 'user' } } },
+      { type: 'assistant/message', time: 200 },
+      { type: 'user/message', time: 300, data: { source: { kind: 'plugin' } } },
+      { type: 'command/run', time: 400 },
+    ];
+    expect(lastConversationMessageAt(events)).toBe(200);
   });
 });
 

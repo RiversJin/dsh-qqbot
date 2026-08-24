@@ -1,14 +1,7 @@
 /** QQ session listing and persisted branch switching. */
 import type { CommandDeps, CategorizedCommand } from './types.js';
 import type { SelectableSession } from '../session/index.js';
-import { getScopePeer } from '../shared/index.js';
-
-function shortSessionId(sessionId: string): string {
-  const normalized = sessionId.startsWith('session-')
-    ? sessionId.slice('session-'.length)
-    : sessionId;
-  return normalized.slice(0, 8);
-}
+import { getScopePeer, shortSessionId } from '../shared/index.js';
 
 function sessionTime(createdAt: number | undefined, timeZone: string): string {
   if (createdAt === undefined || !Number.isFinite(createdAt)) return '时间未知';

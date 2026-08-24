@@ -74,3 +74,11 @@ export function formatRelativeTime(ts?: number): string {
   if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h 前`;
   return `${Math.floor(diff / 86_400_000)}d 前`;
 }
+
+/** Short display id that remains useful for both UUID and `session-*` ids. */
+export function shortSessionId(sessionId: string): string {
+  const normalized = sessionId.startsWith('session-')
+    ? sessionId.slice('session-'.length)
+    : sessionId;
+  return normalized.slice(0, 8);
+}
