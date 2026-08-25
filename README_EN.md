@@ -67,6 +67,7 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 | `timestampTimeZone` | string | `Asia/Singapore` | IANA time zone for model-visible message timestamps |
 | `timestampIntervalMinutes` | number | `30` | Minimum timestamp interval; day changes always emit one |
 | `visibleSessionLimit` | number | `16` | Visible session branches retained per QQ peer |
+| `sessionVisibility` | `lineage` \| `workspace` | `lineage` | Limit `/sessions` to the current QQ lineage or expose all ordinary, unarchived sessions in the configured Workspace |
 | `cwd` | string | `process.cwd()` | Agent working directory |
 | `requireMention` | boolean | `true` | Whether group messages require @bot to trigger |
 | `groupPrompt` | string | - | Extra system prompt for group chats |
@@ -80,7 +81,7 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 | Command | Description |
 |------|------|
 | `/new` (aliases `/reset` `/clear`) | Start a new session (clear context) |
-| `/sessions` (alias `/session-list`) | List recent selectable sessions with creation/fork time, title, and short ID |
+| `/sessions` (alias `/session-list`) | List recent selectable sessions in the configured visibility scope, with creation/fork time, title, and short ID |
 | `/switch <index-or-short-id>` (alias `/resume`) | Switch to and resume an existing session |
 | `/bot-retry` (alias `/bot-regenerate`) | Regenerate from a clean branch before the latest turn; requires `force` after tool use |
 | `/model` | View or switch model |
@@ -127,7 +128,7 @@ Resolution strategy: in-process reuse → persisted resume → fresh create.
 ## Design Principles
 
 - **Pure Cordis plugin** — follows the dsh "Plugins, not loop changes" principle
-- **Declarative dependencies** — `inject = ['agents']`, no direct coupling to other plugins
+- **Declarative dependencies** — `inject = ['agents', 'apiProxy']`, reusing DSH's session-local model selection
 - **Session isolation** — one independent Agent per QQ direct user / group
 - **Preset support** — mount presets (toolkits, prompts, etc.) via the `agent-presets` service
 - **Idle eviction** — auto-dispose Agents on timeout to prevent memory leaks

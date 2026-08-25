@@ -67,6 +67,7 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 | `timestampTimeZone` | string | `Asia/Singapore` | 模型可见消息时间戳使用的 IANA 时区 |
 | `timestampIntervalMinutes` | number | `30` | 时间戳最短注入间隔；跨天时总会注入 |
 | `visibleSessionLimit` | number | `16` | 每个 QQ peer 保留的可见会话分支数 |
+| `sessionVisibility` | `lineage` \| `workspace` | `lineage` | `/sessions` 仅显示当前 QQ 分支，或显示配置 Workspace 中全部普通未归档会话 |
 | `cwd` | string | `process.cwd()` | Agent 工作目录 |
 | `requireMention` | boolean | `true` | 群聊是否需要 @bot 才触发 |
 | `groupPrompt` | string | - | 群聊额外 system prompt |
@@ -80,7 +81,7 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 | 命令 | 说明 |
 |------|------|
 | `/new`（别名 `/reset` `/clear`） | 开始新会话（清空上下文） |
-| `/sessions`（别名 `/session-list`） | 列出最近可选会话（含创建/fork 时间、标题和短 ID） |
+| `/sessions`（别名 `/session-list`） | 按 `sessionVisibility` 列出最近可选会话（含创建/fork 时间、标题和短 ID） |
 | `/switch <序号或短ID>`（别名 `/resume`） | 切换并恢复指定会话 |
 | `/bot-retry`（别名 `/bot-regenerate`） | 从上一轮之前创建干净分支并重新生成；执行过工具时需加 `force` |
 | `/model` | 查看或切换模型 |
@@ -127,7 +128,7 @@ sessionKey: `qqbot:${appId}:${scope}:${peerId}`，由 SHA-256 确定性派生 Se
 ## 设计原则
 
 - **纯 Cordis 插件** — 遵循 dsh "Plugins, not loop changes" 原则
-- **声明式依赖** — `inject = ['agents']`，不直接耦合其他插件
+- **声明式依赖** — `inject = ['agents', 'apiProxy']`，复用 DSH 的会话级模型选择
 - **会话隔离** — 每个 QQ 私聊用户/群聊各一个独立 Agent
 - **Preset 支持** — 可通过 `agent-presets` 服务挂载预设（工具集、prompt 等）
 - **闲置回收** — 超时自动 dispose Agent，防止内存泄漏

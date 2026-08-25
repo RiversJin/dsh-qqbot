@@ -44,6 +44,7 @@ import type {
   AttachmentsLike,
   NativeImageInput,
   LlmResolverLike,
+  ApiProxyLike,
 } from './types.js';
 
 /** ManualCompactionError 各 code 的友好提示（对齐 command-compact 的 expectedFailure 语义） */
@@ -89,6 +90,86 @@ export class SessionManager {
       return this.ctx.get('sessions') as SessionsService | undefined;
     } catch {
       return undefined;
+    }
+  }
+
+  private getApiProxy(): ApiProxyLike | undefined {
+    try {
+      return this.ctx.get('apiProxy') as ApiProxyLike | undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Read Web's live session-local selection, then the durable route, then QQ defaults. */
+  private async resolveSessionRoute(
+    record: SessionRecord,
+    fallback: ModelRoute | undefined,
+  ): Promise<{
+    route: ModelRoute | undefined;
+    /** True when Web has an unlogged selection that must be copied to a new branch. */
+    pendingSelection: boolean;
+  }> {
+    const logged = sessionRequestRoute(record.agent);
+    let current: ModelRoute | undefined;
+    const apiProxy = this.getApiProxy();
+
+    if (apiProxy) {
+      try {
+        const response = await apiProxy.sessions.models({
+          rpcId: randomUUID(),
+          payload: { sessionId: record.sessionId },
+        });
+        if (response.result.ok) {
+          current = normalizeModelRoute(response.result.value.current);
+        } else {
+          this.logger.debug(`session model selection unavailable: sessionId=${record.sessionId} code=${response.result.error.code}`);
+        }
+      } catch (error) {
+        this.logger.debug(`session model selection lookup failed: sessionId=${record.sessionId} err=${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    return {
+      route: selectSessionModelRoute(current, logged, fallback),
+      pendingSelection: current !== undefined && !sameModelRoute(current, logged),
+    };
+  }
+
+  /** Read the latest durable request route before resuming a cold session. */
+  private async inspectSessionRoute(sessionId: string): Promise<ModelRoute | undefined> {
+    let persistence: SessionPersistenceLike | undefined;
+    try {
+      persistence = this.ctx.get('sessionPersistence') as SessionPersistenceLike | undefined;
+    } catch {
+      return undefined;
+    }
+    if (!persistence) return undefined;
+
+    try {
+      const inspected = await persistence.inspect(SessionId(sessionId));
+      return latestSessionModelRoute(inspected.events);
+    } catch (error) {
+      this.logger.debug(`session model route inspection failed: sessionId=${sessionId} err=${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
+    }
+  }
+
+  /** Copy a pending Web selection onto a newly-created retry branch. */
+  private async applyPendingSelection(sessionId: string, route: ModelRoute): Promise<void> {
+    const apiProxy = this.getApiProxy();
+    if (!apiProxy) return;
+
+    try {
+      const response = await apiProxy.sessions.selectModel({
+        rpcId: randomUUID(),
+        payload: { sessionId, ...route },
+      });
+      if (!response.result.ok) {
+        this.logger.warn(`failed to copy pending model selection: sessionId=${sessionId} code=${response.result.error.code} err=${response.result.error.message}`);
+      }
+    } catch (error) {
+      this.logger.warn(`failed to copy pending model selection: sessionId=${sessionId} err=${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -151,7 +232,12 @@ export class SessionManager {
   ): Promise<readonly unknown[]> {
     if (inputs.length === 0) return [];
 
-    const route = this.modelResolver.getEffectiveRoute(this.sessionKey(scope, peerId));
+    const key = this.sessionKey(scope, peerId);
+    const record = this.sessions.get(key);
+    const fallback = this.modelResolver.getEffectiveRoute(key);
+    const route = record
+      ? (await this.resolveSessionRoute(record, fallback)).route
+      : fallback;
     if (route) {
       let llm: LlmResolverLike | undefined;
       try {
@@ -252,7 +338,12 @@ export class SessionManager {
   // ── 模型相关（委托给 ModelResolver） ──
 
   getEffectiveModel(scope: ChatScope, peerId: string): ModelRoute | undefined {
-    return this.modelResolver.getEffectiveRoute(this.sessionKey(scope, peerId));
+    const key = this.sessionKey(scope, peerId);
+    const fallback = this.modelResolver.getEffectiveRoute(key);
+    const record = this.sessions.get(key);
+    return record
+      ? selectSessionModelRoute(undefined, sessionRequestRoute(record.agent), fallback)
+      : fallback;
   }
 
   /**
@@ -302,7 +393,7 @@ export class SessionManager {
         seedLength: seed.length,
         ...(composed.agentPreset ? { agentPreset: composed.agentPreset } : {}),
       },
-      agentOptions: route,
+      agentOptions: agentOptionsFor(route),
       ...(composed.setup ? { setup: composed.setup } : {}),
     });
 
@@ -356,7 +447,11 @@ export class SessionManager {
     const parentId = record.sessionId;
     const childId = SessionId(randomUUID());
     const seed = sourceEvents.slice(0, retryable.startIndex);
-    const route = this.modelResolver.getEffectiveRoute(key);
+    const resolvedRoute = await this.resolveSessionRoute(
+      record,
+      this.modelResolver.getEffectiveRoute(key),
+    );
+    const route = resolvedRoute.route;
     const composed = await this.composePreset(this.config.preset);
     const created = await this.agents.create({
       sessionId: childId,
@@ -367,12 +462,15 @@ export class SessionManager {
         seedLength: seed.length,
         ...(composed.agentPreset ? { agentPreset: composed.agentPreset } : {}),
       },
-      ...(route ? { agentOptions: route } : {}),
+      ...(route ? { agentOptions: agentOptionsFor(route) } : {}),
       ...(composed.setup ? { setup: composed.setup } : {}),
     });
 
     this.applyConfiguredPermission(created.agent);
     await this.attachConfiguredWorkspace(created.agent);
+    if (route && resolvedRoute.pendingSelection) {
+      await this.applyPendingSelection(childId, route);
+    }
 
     // Keep the known-good parent visible until the replay produces an answer.
     await this.rememberVisibleSessions(key, [parentId], false);
@@ -468,12 +566,14 @@ export class SessionManager {
           .map((header) => String(header.id)),
       );
       let candidates = new Set(roots);
+      let workspaceResolved = false;
 
       if (this.config.workspacePath) {
         try {
           const registry = this.ctx.get('workspaceRegistry') as WorkspaceRegistryLike | undefined;
           const workspace = await registry?.resolveByPath(this.config.workspacePath);
           if (workspace) {
+            workspaceResolved = true;
             const archived = new Set((registry?.archivedSessionIds ?? []).map(String));
             candidates = new Set(workspace.sessionIds
               .map(String)
@@ -485,17 +585,24 @@ export class SessionManager {
       }
       candidates = new Set([...candidates].filter((id) => ordinarySessionIds.has(id)));
 
-      // Workspace membership alone is too broad for group deployments. A Web
-      // fork is selectable only when its parent chain reaches a branch already
-      // owned by this exact QQ peer.
-      const allowed = collectLineageSessionIds(headers, roots, candidates);
+      // The safe default keeps peer lineages isolated. Personal deployments
+      // can deliberately expose all ordinary, unarchived sessions in the
+      // configured Workspace so Web and QQ share one conversation picker.
+      const effectiveVisibility = this.config.sessionVisibility === 'workspace' && workspaceResolved
+        ? 'workspace'
+        : 'lineage';
+      const allowed = selectSessionIdsForVisibility(
+        headers,
+        roots,
+        candidates,
+        effectiveVisibility,
+      );
       const limit = Math.max(1, Math.floor(Number(this.config.visibleSessionLimit) || 16));
       const ordered = [...allowed]
         .map((sessionId) => ({ sessionId, header: headerById.get(sessionId) }))
-        .sort((a, b) => (b.header?.createdAt ?? 0) - (a.header?.createdAt ?? 0))
-        .slice(0, limit);
+        .sort((a, b) => (b.header?.createdAt ?? 0) - (a.header?.createdAt ?? 0));
 
-      const sessions = await Promise.all(ordered.map(async ({ sessionId, header }): Promise<SelectableSession> => {
+      const inspected = await Promise.all(ordered.map(async ({ sessionId, header }): Promise<SelectableSession | undefined> => {
         let events = this.agents.get(sessionId)?.session.events;
         if (!events) {
           try {
@@ -503,6 +610,14 @@ export class SessionManager {
           } catch (error) {
             this.logger.debug(`session title unavailable: sessionId=${sessionId} err=${error instanceof Error ? error.message : String(error)}`);
           }
+        }
+        if (
+          effectiveVisibility === 'workspace'
+          && sessionId !== currentId
+          && events !== undefined
+          && !sessionHasVisibleContent(events)
+        ) {
+          return undefined;
         }
         return {
           sessionId,
@@ -512,6 +627,9 @@ export class SessionManager {
           current: sessionId === currentId,
         };
       }));
+      const sessions = inspected
+        .filter((session): session is SelectableSession => session !== undefined)
+        .slice(0, limit);
 
       return { ok: true, sessions };
     } catch (error) {
@@ -552,9 +670,11 @@ export class SessionManager {
     let createdHandle: DshAgentHandle | undefined;
     try {
       const live = this.agents.get(targetId);
+      const persistedRoute = live ? undefined : await this.inspectSessionRoute(targetId);
+      const resumeRoute = persistedRoute ?? this.modelResolver.getResumeRoute(key);
       const agent = live ?? (createdHandle = await this.agents.resume({
         resumeSessionId: targetId,
-        ...(this.modelResolver.getResumeRoute(key) ? { agentOptions: this.modelResolver.getResumeRoute(key) } : {}),
+        ...(resumeRoute ? { agentOptions: agentOptionsFor(resumeRoute) } : {}),
         ...(composed.setup ? { setup: composed.setup } : {}),
       })).agent;
 
@@ -727,10 +847,11 @@ export class SessionManager {
       const composed = await this.composePreset(this.config.preset);
       agentPreset = composed.agentPreset;
       try {
-        const resumeRoute = this.modelResolver.getResumeRoute(key);
+        const persistedRoute = await this.inspectSessionRoute(sessionId);
+        const resumeRoute = persistedRoute ?? this.modelResolver.getResumeRoute(key);
         const resumed = await this.agents.resume({
           resumeSessionId: sessionId,
-          ...(resumeRoute ? { agentOptions: resumeRoute } : {}),
+          ...(resumeRoute ? { agentOptions: agentOptionsFor(resumeRoute) } : {}),
           ...(composed.setup ? { setup: composed.setup } : {}),
         });
         agent = resumed.agent;
@@ -743,7 +864,7 @@ export class SessionManager {
             cwd: this.config.cwd || process.cwd(),
             ...(agentPreset ? { agentPreset } : {}),
           },
-          ...(route ? { agentOptions: route } : {}),
+          ...(route ? { agentOptions: agentOptionsFor(route) } : {}),
           ...(composed.setup ? { setup: composed.setup } : {}),
         });
         agent = created.agent;
@@ -825,7 +946,10 @@ export class SessionManager {
     }
     if (!compaction) return { ok: false, reason: 'unavailable' };
 
-    const route = this.modelResolver.getEffectiveRoute(key);
+    const route = (await this.resolveSessionRoute(
+      record,
+      this.modelResolver.getEffectiveRoute(key),
+    )).route;
     const agentCtx = {
       session: record.agent.session,
       options: { provider: route?.provider, model: route?.model },
@@ -869,6 +993,66 @@ export class SessionManager {
   }
 }
 
+function normalizeModelRoute(value: unknown): ModelRoute | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const route = value as { provider?: unknown; model?: unknown; reasoningEffort?: unknown };
+  if (typeof route.provider !== 'string' || !route.provider) return undefined;
+  if (typeof route.model !== 'string' || !route.model) return undefined;
+  return {
+    provider: route.provider,
+    model: route.model,
+    ...(typeof route.reasoningEffort === 'string' && route.reasoningEffort
+      ? { reasoningEffort: route.reasoningEffort }
+      : {}),
+  };
+}
+
+function sameModelRoute(left: ModelRoute | undefined, right: ModelRoute | undefined): boolean {
+  return left !== undefined
+    && right !== undefined
+    && left.provider === right.provider
+    && left.model === right.model
+    && left.reasoningEffort === right.reasoningEffort;
+}
+
+function agentOptionsFor(route: ModelRoute): { provider: string; model: string } {
+  return { provider: route.provider, model: route.model };
+}
+
+function sessionRequestRoute(agent: DshAgent): ModelRoute | undefined {
+  try {
+    const direct = normalizeModelRoute(agent.session.requestHeader?.()?.config);
+    if (direct) return direct;
+  } catch {
+    // Fall through to the durable events for lightweight/mocked session views.
+  }
+  return latestSessionModelRoute(agent.session.events ?? []);
+}
+
+/** Last durable request route recorded by DSH for this session. */
+export function latestSessionModelRoute(
+  events: readonly SessionEventLike[],
+): ModelRoute | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.type !== 'request/header') continue;
+    const dataHeader = event.data?.header as { config?: unknown } | undefined;
+    const topHeader = event.header as { config?: unknown } | undefined;
+    const route = normalizeModelRoute(dataHeader?.config ?? topHeader?.config);
+    if (route) return route;
+  }
+  return undefined;
+}
+
+/** Active Web choice wins; otherwise retain the session route before QQ defaults. */
+export function selectSessionModelRoute(
+  current: ModelRoute | undefined,
+  logged: ModelRoute | undefined,
+  fallback: ModelRoute | undefined,
+): ModelRoute | undefined {
+  return current ?? logged ?? fallback;
+}
+
 interface RetryableTurn {
   startIndex: number;
   endIndex: number;
@@ -895,6 +1079,27 @@ export function collectLineageSessionIds(
     }
   }
   return allowed;
+}
+
+/** Apply the configured picker scope after Workspace/archive filtering. */
+export function selectSessionIdsForVisibility(
+  headers: readonly SessionHeaderLike[],
+  roots: ReadonlySet<string>,
+  candidates: ReadonlySet<string>,
+  visibility: ImQQBotConfig['sessionVisibility'],
+): Set<string> {
+  return visibility === 'workspace'
+    ? new Set(candidates)
+    : collectLineageSessionIds(headers, roots, candidates);
+}
+
+/** Hide empty Web placeholders while retaining actual conversations. */
+export function sessionHasVisibleContent(events: readonly SessionEventLike[]): boolean {
+  return events.some((event) => (
+    event.type === 'user/message'
+    || event.type === 'assistant/message'
+    || event.type === 'session/title'
+  ));
 }
 
 type SelectorResolution =

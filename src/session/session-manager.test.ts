@@ -2,8 +2,12 @@ import { describe, expect, it } from 'vitest';
 import {
   collectLineageSessionIds,
   findLastRetryableTurn,
+  latestSessionModelRoute,
   lastConversationMessageAt,
   resolveSessionSelector,
+  selectSessionIdsForVisibility,
+  selectSessionModelRoute,
+  sessionHasVisibleContent,
 } from './session-manager.js';
 import type { SelectableSession, SessionEventLike, SessionHeaderLike } from './types.js';
 
@@ -92,5 +96,59 @@ describe('QQ session selection', () => {
       new Set(ordinary.map((header) => header.id)),
     );
     expect([...allowed]).toEqual(['root', 'child', 'grandchild']);
+  });
+
+  it('can expose every ordinary Workspace session for a personal deployment', () => {
+    const headers: SessionHeaderLike[] = [
+      { id: 'qq-root', createdAt: 1 },
+      { id: 'qq-child', createdAt: 2, parentSession: 'qq-root' },
+      { id: 'web-root', createdAt: 3 },
+    ];
+    const candidates = new Set(headers.map((header) => header.id));
+
+    expect([...selectSessionIdsForVisibility(
+      headers,
+      new Set(['qq-root']),
+      candidates,
+      'workspace',
+    )]).toEqual(['qq-root', 'qq-child', 'web-root']);
+  });
+
+  it('recognizes and hides empty Workspace placeholders', () => {
+    expect(sessionHasVisibleContent([
+      { type: 'session' },
+      { type: 'permission/preset' },
+    ])).toBe(false);
+    expect(sessionHasVisibleContent([
+      { type: 'session' },
+      { type: 'user/message', data: { content: 'hello' } },
+    ])).toBe(true);
+  });
+});
+
+describe('QQ session model routing', () => {
+  const kimi = { provider: 'kimi-coding', model: 'k3' };
+  const qwen = {
+    provider: 'qwen38-local',
+    model: 'Qwen3.8-27B/Qwen3.8-27B-UD-Q4_K_XL.gguf',
+    reasoningEffort: 'xhigh',
+  };
+
+  it('prefers an unlogged Web selection over the durable and QQ routes', () => {
+    expect(selectSessionModelRoute(qwen, kimi, kimi)).toEqual(qwen);
+  });
+
+  it('retains the durable session route before falling back to QQ preferences', () => {
+    expect(selectSessionModelRoute(undefined, qwen, kimi)).toEqual(qwen);
+    expect(selectSessionModelRoute(undefined, undefined, kimi)).toEqual(kimi);
+  });
+
+  it('reads the latest request header including reasoning effort', () => {
+    const events: SessionEventLike[] = [
+      { type: 'request/header', data: { header: { config: kimi } } },
+      { type: 'assistant/message' },
+      { type: 'request/header', data: { header: { config: qwen } } },
+    ];
+    expect(latestSessionModelRoute(events)).toEqual(qwen);
   });
 });

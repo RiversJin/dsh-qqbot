@@ -6,6 +6,8 @@
 export interface ModelRoute {
   provider: string;
   model: string;
+  /** Adapter-owned reasoning level selected for the session, when explicit. */
+  reasoningEffort?: string;
 }
 
 /** 模型信息条目 */

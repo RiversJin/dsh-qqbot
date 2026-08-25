@@ -3,6 +3,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis';
 import type { ChatScope, ReplyTarget } from '../types.js';
+import type { ModelRoute } from '../model/types.js';
 
 /** AgentSetup hook 类型 */
 export type AgentSetup = (agentCtx: Context) => Promise<void> | void;
@@ -36,6 +37,7 @@ export interface DshAgent {
     readonly id: string;
     readonly events?: readonly SessionEventLike[];
     readonly header?: SessionHeaderLike;
+    requestHeader?(): { config?: ModelRoute } | undefined;
   };
   cancel(cause: { kind: string }): void;
   followup(message: unknown): void;
@@ -178,6 +180,27 @@ export interface LlmModelInfoLike {
 
 export interface LlmResolverLike {
   resolveModelInfo(provider: string, model: string): Promise<LlmModelInfoLike>;
+}
+
+export interface ApiProxyLike {
+  sessions: {
+    models(request: {
+      rpcId: string;
+      payload: { sessionId: string };
+    }): Promise<{
+      result:
+        | { ok: true; value: { current: ModelRoute } }
+        | { ok: false; error: { code: string; message: string } };
+    }>;
+    selectModel(request: {
+      rpcId: string;
+      payload: ModelRoute & { sessionId: string };
+    }): Promise<{
+      result:
+        | { ok: true; value: { selected: ModelRoute } }
+        | { ok: false; error: { code: string; message: string } };
+    }>;
+  };
 }
 
 /** agent-presets 服务接口（可选，部署中可能没有） */
