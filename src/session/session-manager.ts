@@ -538,8 +538,16 @@ export class SessionManager {
     };
   }
 
-  /** List recent sessions belonging to this QQ peer's branch lineage. */
+  /** List recent selectable sessions, capped for the compact QQ picker. */
   async listSessions(scope: ChatScope, peerId: string): Promise<SessionListOutcome> {
+    const collected = await this.collectSelectableSessions(scope, peerId);
+    if (!collected.ok) return collected;
+    const limit = Math.max(1, Math.floor(Number(this.config.visibleSessionLimit) || 16));
+    return { ok: true, sessions: collected.sessions.slice(0, limit) };
+  }
+
+  /** Collect every eligible session before applying the picker display limit. */
+  private async collectSelectableSessions(scope: ChatScope, peerId: string): Promise<SessionListOutcome> {
     const key = this.sessionKey(scope, peerId);
     const currentId = this.currentSessionId(key);
     const roots = new Set([
@@ -597,10 +605,8 @@ export class SessionManager {
         candidates,
         effectiveVisibility,
       );
-      const limit = Math.max(1, Math.floor(Number(this.config.visibleSessionLimit) || 16));
       const ordered = [...allowed]
-        .map((sessionId) => ({ sessionId, header: headerById.get(sessionId) }))
-        .sort((a, b) => (b.header?.createdAt ?? 0) - (a.header?.createdAt ?? 0));
+        .map((sessionId) => ({ sessionId, header: headerById.get(sessionId) }));
 
       const inspected = await Promise.all(ordered.map(async ({ sessionId, header }): Promise<SelectableSession | undefined> => {
         let events = this.agents.get(sessionId)?.session.events;
@@ -619,17 +625,19 @@ export class SessionManager {
         ) {
           return undefined;
         }
+        const lastMessageAt = lastConversationMessageAt(events);
         return {
           sessionId,
           ...(header?.createdAt !== undefined ? { createdAt: header.createdAt } : {}),
+          ...(lastMessageAt !== undefined ? { lastMessageAt } : {}),
           ...(header?.parentSession ? { parentSession: String(header.parentSession) } : {}),
           ...(latestSessionTitle(events) ? { title: latestSessionTitle(events) } : {}),
           current: sessionId === currentId,
         };
       }));
-      const sessions = inspected
-        .filter((session): session is SelectableSession => session !== undefined)
-        .slice(0, limit);
+      const sessions = sortSessionsByRecentActivity(
+        inspected.filter((session): session is SelectableSession => session !== undefined),
+      );
 
       return { ok: true, sessions };
     } catch (error) {
@@ -639,7 +647,7 @@ export class SessionManager {
     }
   }
 
-  /** Switch this QQ peer to one listed persisted branch and resume it. */
+  /** Switch to a picker entry, or to an exact eligible full session id. */
   async switchSession(
     scope: ChatScope,
     peerId: string,
@@ -648,10 +656,12 @@ export class SessionManager {
     replyTarget: ReplyTarget,
   ): Promise<SwitchSessionOutcome> {
     const key = this.sessionKey(scope, peerId);
-    const listed = await this.listSessions(scope, peerId);
-    if (!listed.ok) return { ok: false, reason: 'failed', message: listed.message };
+    const collected = await this.collectSelectableSessions(scope, peerId);
+    if (!collected.ok) return { ok: false, reason: 'failed', message: collected.message };
+    const limit = Math.max(1, Math.floor(Number(this.config.visibleSessionLimit) || 16));
+    const listed = collected.sessions.slice(0, limit);
 
-    const resolved = resolveSessionSelector(listed.sessions, selector);
+    const resolved = resolveSwitchSessionSelector(listed, collected.sessions, selector);
     if (resolved.kind === 'not-found') return { ok: false, reason: 'not-found' };
     if (resolved.kind === 'ambiguous') {
       return { ok: false, reason: 'ambiguous', matches: resolved.matches };
@@ -1128,6 +1138,39 @@ export function resolveSessionSelector(
   if (matches.length === 1) return { kind: 'found', session: matches[0]! };
   if (matches.length > 1) return { kind: 'ambiguous', matches };
   return { kind: 'not-found' };
+}
+
+/**
+ * Keep indexes and short ids scoped to the displayed picker, while allowing an
+ * exact `session-*` id to address any session that passed the same eligibility
+ * checks before the display limit was applied.
+ */
+export function resolveSwitchSessionSelector(
+  visibleSessions: readonly SelectableSession[],
+  eligibleSessions: readonly SelectableSession[],
+  rawSelector: string,
+): SelectorResolution {
+  const visible = resolveSessionSelector(visibleSessions, rawSelector);
+  if (visible.kind !== 'not-found') return visible;
+
+  const selector = rawSelector.trim().toLowerCase();
+  if (!selector.startsWith('session-')) return visible;
+  const exact = eligibleSessions.find(({ sessionId }) => sessionId.toLowerCase() === selector);
+  return exact ? { kind: 'found', session: exact } : visible;
+}
+
+/** New activity revives an old Web session; creation time is only a fallback. */
+export function sortSessionsByRecentActivity(
+  sessions: readonly SelectableSession[],
+): SelectableSession[] {
+  return [...sessions].sort((left, right) => {
+    const activityDiff = (right.lastMessageAt ?? right.createdAt ?? 0)
+      - (left.lastMessageAt ?? left.createdAt ?? 0);
+    if (activityDiff !== 0) return activityDiff;
+    const creationDiff = (right.createdAt ?? 0) - (left.createdAt ?? 0);
+    if (creationDiff !== 0) return creationDiff;
+    return left.sessionId.localeCompare(right.sessionId);
+  });
 }
 
 /** Last durable title wins; absent titles stay absent rather than inventing one. */

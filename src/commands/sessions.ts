@@ -46,21 +46,21 @@ export function sessionsCommand({ manager, config }: CommandDeps): CategorizedCo
         '🗂 最近会话',
         ...result.sessions.map((session, index) => renderSession(session, index, config.timestampTimeZone)),
         '',
-        '● 为当前会话；使用 /switch 序号 或 /switch 短ID',
+        '● 为当前会话；使用 /switch 序号、短ID或完整 session-ID',
       ].join('\n');
     },
   };
 }
 
-/** /switch (alias /resume) — switch to one persisted branch from /sessions. */
+/** /switch (alias /resume) — switch by picker selector or exact eligible session id. */
 export function switchCommand({ manager, config }: CommandDeps): CategorizedCommand {
   return {
     name: ['switch', 'resume'],
     category: 'agent',
-    description: '切换到已有会话（序号或短ID）',
+    description: '切换到已有会话（序号、短ID或完整 session-ID）',
     handler: async (cmdCtx) => {
       const selector = cmdCtx.command.raw.trim();
-      if (!selector) return '用法: /switch <序号或短ID>\n先用 /sessions 查看可选会话';
+      if (!selector) return '用法: /switch <序号、短ID或完整 session-ID>\n先用 /sessions 查看可选会话';
       const { scope, peerId } = getScopePeer(cmdCtx);
       const result = await manager.switchSession(
         scope,
@@ -82,7 +82,7 @@ export function switchCommand({ manager, config }: CommandDeps): CategorizedComm
         const ids = (result.matches ?? []).map((session) => shortSessionId(session.sessionId)).join('、');
         return `短ID不唯一（${ids}），请使用更多字符或 /sessions 中的序号`;
       }
-      if (result.reason === 'not-found') return '找不到该会话，请先使用 /sessions 查看可选会话';
+      if (result.reason === 'not-found') return '找不到该会话，或它不在允许的 Workspace 范围内';
       return `切换失败: ${result.message ?? '未知错误'}`;
     },
   };

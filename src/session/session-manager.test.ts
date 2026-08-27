@@ -5,9 +5,11 @@ import {
   latestSessionModelRoute,
   lastConversationMessageAt,
   resolveSessionSelector,
+  resolveSwitchSessionSelector,
   selectSessionIdsForVisibility,
   selectSessionModelRoute,
   sessionHasVisibleContent,
+  sortSessionsByRecentActivity,
 } from './session-manager.js';
 import type { SelectableSession, SessionEventLike, SessionHeaderLike } from './types.js';
 
@@ -78,6 +80,39 @@ describe('QQ session selection', () => {
       { sessionId: 'de570bfb-aaaa-bbbb-cccc-000000000000', current: false },
     ];
     expect(resolveSessionSelector(ambiguous, 'de570')).toMatchObject({ kind: 'ambiguous' });
+  });
+
+  it('sorts old Web sessions by their latest real conversation activity', () => {
+    const oldButActive: SelectableSession = {
+      sessionId: 'session-old',
+      createdAt: 100,
+      lastMessageAt: 500,
+      current: false,
+    };
+    const newButIdle: SelectableSession = {
+      sessionId: 'session-new',
+      createdAt: 400,
+      current: false,
+    };
+
+    expect(sortSessionsByRecentActivity([newButIdle, oldButActive]))
+      .toEqual([oldButActive, newButIdle]);
+  });
+
+  it('allows only an exact full id to bypass the displayed session limit', () => {
+    const hidden: SelectableSession = {
+      sessionId: 'session-dcb0216d-74c6-4493-82c0-67751590c1c7',
+      createdAt: 100,
+      current: false,
+    };
+    const eligible = [...sessions, hidden];
+
+    expect(resolveSwitchSessionSelector(sessions, eligible, hidden.sessionId))
+      .toEqual({ kind: 'found', session: hidden });
+    expect(resolveSwitchSessionSelector(sessions, eligible, 'dcb0216d'))
+      .toEqual({ kind: 'not-found' });
+    expect(resolveSwitchSessionSelector(sessions, eligible, '3'))
+      .toEqual({ kind: 'not-found' });
   });
 
   it('includes transitive Web forks but excludes unrelated workspace sessions', () => {

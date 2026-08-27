@@ -103,6 +103,8 @@ export interface SessionPersistenceLike {
 export interface SelectableSession {
   sessionId: string;
   createdAt?: number;
+  /** Latest real user/assistant message, used for recent-activity ordering. */
+  lastMessageAt?: number;
   title?: string;
   parentSession?: string;
   current: boolean;
