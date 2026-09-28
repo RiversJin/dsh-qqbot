@@ -83,7 +83,7 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 | `/new` (aliases `/reset` `/clear`) | Start a new session (clear context) |
 | `/sessions` (alias `/session-list`) | List selectable sessions by latest real conversation activity in the configured visibility scope, with creation/fork time, title, and short ID |
 | `/switch <index, short ID, or full session ID>` (alias `/resume`) | Switch to and resume a session; an exact full ID may bypass the display limit but still passes Workspace/archive/subagent/content checks |
-| `/bot-retry` (alias `/bot-regenerate`) | Regenerate from a clean branch before the latest turn; requires `force` after tool use |
+| `/retry` (aliases `/bot-retry`, `/bot-regenerate`) | Replay the original request and tools in the same session; requires enabled `dsh-retry >= 0.2.0`, no `force` needed |
 | `/model` | View or switch model |
 | `/stop` | Abort the current generation |
 | `/bot-ping` | Connectivity test |

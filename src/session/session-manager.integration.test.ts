@@ -60,6 +60,7 @@ function fixture() {
   const ctx = {
     get: (name: keyof typeof services) => services[name],
     sessionController,
+    commands: { execute: vi.fn(async () => ({ result: { kind: 'success' as string, text: 'started' } })) },
     sessionQuery: {
       readSession: vi.fn(async (id: string) => ({ events: logs.get(id) ?? [] })),
       observeSession: vi.fn(async () => { throw new Error('no stored session'); }),
@@ -90,37 +91,28 @@ function turn(session: Session, id: number, text: string) {
 }
 
 describe('QQ session management against V4 sessions', () => {
-  it('retries into one child, preserves the parent and copies the pending Web choice', async () => {
+  it('routes retry through the shared native command on the same agent and session', async () => {
     const f = fixture();
     const record = await f.manager.getOrCreate('c2c', 'test-peer', 'sender', { scope: 'c2c', targetId: 'test-peer' });
-    const parentId = record.sessionId;
-    const parent = record.agent.session;
-    turn(parent, 1, 'keep');
-    const cut = f.logs.get(parentId)!.length;
-    const user = turn(parent, 2, 'retry me');
-    const original = structuredClone(f.logs.get(parentId));
-
+    const id = record.sessionId, agent = record.agent;
+    turn(agent.session, 1, 'retry me');
     const result = await f.manager.regenerateLast('c2c', 'test-peer');
-    expect(result.ok).toBe(true);
-    expect(f.logs.get(parentId)).toEqual(original);
-    expect(f.agents.create).toHaveBeenCalledTimes(2);
+    expect(result).toEqual({ ok: true, sessionId: id });
+    expect(record.agent).toBe(agent);
+    expect(f.ctx.commands.execute).toHaveBeenCalledWith(agent, '/retry', [], expect.any(AbortSignal));
+    expect(f.agents.create).toHaveBeenCalledTimes(1);
     expect(f.services.sessions.fork).not.toHaveBeenCalled();
-    expect(record.agent.session.inheritedEventCount).toBe(cut);
-    expect(record.agent.session.header).toMatchObject({ isSeeded: true, parentSession: parentId });
-    expect(record.agent.session.deriveMessages().map(message => message.content)).toHaveLength(2);
-    expect(record.agent.followup).toHaveBeenCalledWith(user);
-    expect(f.ctx.sessionController.selectModel).toHaveBeenCalledWith({ sessionId: result.sessionId, ...f.route });
-    expect(f.agents.create.mock.calls[1]![0].agentOptions).toEqual(f.route);
+    expect(f.ctx.sessionController.selectModel).not.toHaveBeenCalled();
   });
 
-  it('allows an empty inherited prefix when retrying the first turn', async () => {
+  it('preserves the native failure and keeps the original session', async () => {
     const f = fixture();
     const record = await f.manager.getOrCreate('c2c', 'test-peer', 'sender', { scope: 'c2c', targetId: 'test-peer' });
-    turn(record.agent.session, 1, 'first');
-    await f.manager.regenerateLast('c2c', 'test-peer');
-    expect(record.agent.session.inheritedEventCount).toBe(0);
-    expect(record.agent.session.header.isSeeded).toBe(true);
-    expect(record.agent.session.deriveMessages()).toHaveLength(0);
+    f.ctx.commands.execute.mockResolvedValue({ result: { kind: 'error', text: 'busy' } });
+    const result = await f.manager.regenerateLast('c2c', 'test-peer');
+    expect(result).toEqual({ ok: false, reason: 'failed', message: 'busy' });
+    expect(f.agents.create).toHaveBeenCalledTimes(1);
+    expect(f.manager.getSessionRecord('c2c', 'test-peer')).toBe(record);
   });
 
   it('model switching creates only the intended child with the full inherited prefix', async () => {

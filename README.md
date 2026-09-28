@@ -83,7 +83,7 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 | `/new`（别名 `/reset` `/clear`） | 开始新会话（清空上下文） |
 | `/sessions`（别名 `/session-list`） | 按 `sessionVisibility` 和最近真实对话时间列出可选会话（含创建/fork 时间、标题和短 ID） |
 | `/switch <序号、短ID或完整 session-ID>`（别名 `/resume`） | 切换并恢复指定会话；完整 ID 可绕过列表条数限制，但仍须通过 Workspace/归档/subagent/非空校验 |
-| `/bot-retry`（别名 `/bot-regenerate`） | 从上一轮之前创建干净分支并重新生成；执行过工具时需加 `force` |
+| `/retry`（别名 `/bot-retry`、`/bot-regenerate`） | 在当前会话从原问题重新生成，工具重新执行；需启用 `dsh-retry >= 0.2.0`，无需 `force` |
 | `/model` | 查看或切换模型 |
 | `/stop` | 中止当前生成 |
 | `/bot-ping` | 连通性测试 |

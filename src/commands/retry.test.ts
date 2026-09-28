@@ -4,55 +4,48 @@ import type { SessionManager } from '../session/index.js';
 
 function commandContext(raw = '') {
   return {
-    command: { name: 'bot-retry', args: raw ? [raw] : [], raw },
+    command: { name: 'retry', args: raw ? [raw] : [], raw },
     message: { kind: 'c2c', senderId: 'user-1' },
-    replyTarget: { scope: 'c2c', targetId: 'user-1', msgId: 'msg-1' },
+    replyTarget: { scope: 'c2c', targetId: 'user-1', msgId: 'current-command' },
   } as never;
 }
 
-describe('/bot-retry', () => {
-  it('restores an idle-evicted session before regeneration', async () => {
-    let active = false;
-    const getOrCreate = vi.fn(async () => { active = true; });
-    const regenerateLast = vi.fn(async () => ({ ok: true }));
-    const manager = {
-      getSessionRecord: vi.fn(() => active ? {} : undefined),
-      getOrCreate,
-      regenerateLast,
-    } as unknown as SessionManager;
+function fixture(result = { ok: true } as { ok: boolean; message?: string }) {
+  const manager = { getOrCreate: vi.fn(async () => ({})), regenerateLast: vi.fn(async () => result) };
+  const command = retryCommand({ manager: manager as unknown as SessionManager, config: {} as never });
+  return { manager, command };
+}
 
-    const result = await retryCommand({ manager, config: {} as never }).handler(commandContext());
-
-    expect(result).toBe('已从上一轮之前创建干净分支并重新生成 ✓');
-    expect(getOrCreate).toHaveBeenCalledTimes(1);
-    expect(regenerateLast).toHaveBeenCalledWith('c2c', 'user-1', false);
-    expect(getOrCreate.mock.invocationCallOrder[0]).toBeLessThan(regenerateLast.mock.invocationCallOrder[0]!);
+describe('/retry', () => {
+  it('registers the short command and retains both old names', () => {
+    expect(fixture().command.name).toEqual(['retry', 'bot-retry', 'bot-regenerate']);
   });
 
-  it('does not restore an already-active session and preserves force', async () => {
-    const getOrCreate = vi.fn();
-    const regenerateLast = vi.fn(async () => ({ ok: true }));
-    const manager = {
-      getSessionRecord: vi.fn(() => ({})),
-      getOrCreate,
-      regenerateLast,
-    } as unknown as SessionManager;
-
-    await retryCommand({ manager, config: {} as never }).handler(commandContext('--force'));
-
-    expect(getOrCreate).not.toHaveBeenCalled();
-    expect(regenerateLast).toHaveBeenCalledWith('c2c', 'user-1', true);
+  it('restores cold sessions and updates the reply target before native retry', async () => {
+    const { manager, command } = fixture();
+    expect(await command.handler(commandContext())).toBe('已在当前会话从原问题重新生成 ✓');
+    expect(manager.getOrCreate).toHaveBeenCalledWith('c2c', 'user-1', 'user-1', {
+      scope: 'c2c', targetId: 'user-1', msgId: 'current-command',
+    });
+    expect(manager.regenerateLast).toHaveBeenCalledWith('c2c', 'user-1');
+    expect(manager.getOrCreate.mock.invocationCallOrder[0]).toBeLessThan(manager.regenerateLast.mock.invocationCallOrder[0]!);
   });
 
-  it('requires explicit force when the last turn used tools', async () => {
-    const manager = {
-      getSessionRecord: vi.fn(() => ({})),
-      regenerateLast: vi.fn(async () => ({ ok: false, reason: 'tool-risk', toolCount: 2 })),
-    } as unknown as SessionManager;
+  it.each(['force', '--force'])('accepts %s as an equivalent compatibility spelling', async raw => {
+    const { manager, command } = fixture();
+    await command.handler(commandContext(raw));
+    expect(manager.regenerateLast).toHaveBeenCalledWith('c2c', 'user-1');
+  });
 
-    const result = await retryCommand({ manager, config: {} as never }).handler(commandContext());
+  it('returns native busy or failure details without falling back to a fork', async () => {
+    const { command } = fixture({ ok: false, message: '当前会话仍在运行，暂时不能重试。' });
+    expect(await command.handler(commandContext())).toBe('当前会话仍在运行，暂时不能重试。');
+  });
 
-    expect(result).toContain('/bot-retry force');
-    expect(result).toContain('2');
+  it('rejects unexpected arguments before touching the session', async () => {
+    const { manager, command } = fixture();
+    expect(await command.handler(commandContext('something'))).toBe('用法: /retry');
+    expect(manager.getOrCreate).not.toHaveBeenCalled();
+    expect(manager.regenerateLast).not.toHaveBeenCalled();
   });
 });

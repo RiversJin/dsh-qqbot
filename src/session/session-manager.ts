@@ -15,6 +15,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { SessionId, SessionSeq, SessionLogOffset, buildForkSeed, deriveEventMessage, type SessionEvent } from '@deepseek-ai/dsh-session';
 import type {} from '@deepseek-ai/dsh-session-query';
+import type {} from '@deepseek-ai/dsh-commands';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { emptySummary, foldQqSummary, type QqSessionSummary } from './projection.js';
@@ -134,13 +135,6 @@ export class SessionManager {
       this.logger.debug(`session model route inspection failed: sessionId=${sessionId} err=${error instanceof Error ? error.message : String(error)}`);
       return undefined;
     }
-  }
-
-  /** Copy a pending Web selection onto a newly-created retry branch. */
-  private async applyPendingSelection(sessionId: string, route: ModelRoute): Promise<void> {
-    // Use the native controller to keep the live selection, durable log and Web
-    // state in sync. This replaces the previous apiProxy.selectModel call.
-    await this.ctx.sessionController.selectModel({ sessionId: SessionId(sessionId), ...route });
   }
 
   /** Enforce the connector-level permission policy on every QQ-owned session. */
@@ -388,93 +382,32 @@ export class SessionManager {
     this.logger.info(`model switched via fork: key=${key} → ${route.provider}/${route.model} sessionId=${childId}`);
   }
 
-  /**
-   * Re-run the latest user turn from a clean branch. The original conversation
-   * is not mutated; the child is seeded before turn/start and receives the
-   * original user message again.
-   */
+  /** Execute the shared native retry command on the existing QQ session. */
   async regenerateLast(
     scope: ChatScope,
     peerId: string,
-    force = false,
   ): Promise<{
     ok: boolean;
-    reason?: 'no-session' | 'no-turn' | 'tool-risk';
-    toolCount?: number;
+    reason?: 'no-session' | 'unavailable' | 'failed';
+    message?: string;
     sessionId?: string;
   }> {
     const key = this.sessionKey(scope, peerId);
     const record = this.sessions.get(key);
     if (!record) return { ok: false, reason: 'no-session' };
 
-    await record.agent.whenIdle();
-    const sourceEvents = await this.readEvents(record.sessionId);
-    const retryable = findLastRetryableTurn(sourceEvents);
-    if (!retryable) return { ok: false, reason: 'no-turn' };
-    if (retryable.toolCount > 0 && !force) {
-      return { ok: false, reason: 'tool-risk', toolCount: retryable.toolCount };
-    }
-
-    const originalEvent = sourceEvents.find(event => event === retryable.userEvent);
-    if (originalEvent?.type !== 'user/message') return { ok: false, reason: 'no-turn' };
-    const originalMessage = originalEvent.data;
-
-    const parentId = record.sessionId;
-    const childId = SessionId(randomUUID());
-    const inheritedEventCount = retryable.startIndex;
-    const seed = inheritedEventCount === 0 ? [] : buildForkSeed(sourceEvents, SessionSeq(inheritedEventCount - 1));
-    const resolvedRoute = await this.resolveSessionRoute(
-      record,
-      this.modelResolver.getEffectiveRoute(key),
+    // Keep command lifecycle events so the same session also renders correctly
+    // in Web. The registered handler owns busy checks and original-input replay.
+    const execution = await this.ctx.commands.execute(
+      record.agent, '/retry', [], new AbortController().signal,
     );
-    const route = resolvedRoute.route;
-    const composed = await this.composePreset(this.config.preset);
-    const created = await this.agents.create({
-      sessionId: childId,
-      seed,
-      inheritedEventCount: SessionLogOffset(inheritedEventCount),
-      meta: {
-        cwd: this.config.cwd || process.cwd(),
-        parentSession: SessionId(parentId),
-        isSeeded: true,
-        ...(composed.agentPreset ? { agentPreset: composed.agentPreset } : {}),
-      },
-      ...(route ? { agentOptions: agentOptionsFor(route) } : {}),
-      ...(composed.setup ? { setup: composed.setup } : {}),
-    });
-
-    this.applyConfiguredPermission(created.agent);
-    await this.attachConfiguredWorkspace(created.agent);
-    if (route && resolvedRoute.pendingSelection) {
-      await this.applyPendingSelection(childId, route);
+    if (!execution) return { ok: false, reason: 'unavailable', message: '原地重试不可用，请启用 dsh-retry 0.2.0 或更新版本。' };
+    if (execution.result.kind !== 'success') {
+      return { ok: false, reason: 'failed', message: execution.result.text ?? '无法开始重试' };
     }
-
-    // Keep the known-good parent visible until the replay produces an answer.
-    await this.rememberVisibleSessions(key, [parentId], false);
-    this.modelResolver.setSessionId(key, childId);
-
-    const oldHandle = record.handle;
-    record.sessionId = childId;
-    record.agent = created.agent;
-    record.handle = created;
-    record.agentPreset = composed.agentPreset;
     record.lastActivity = Date.now();
-    void oldHandle.dispose().catch(() => {});
-
-    created.agent.followup(structuredClone(originalMessage));
-    void created.agent.whenIdle().then(async () => {
-      const generated = (this.summary(created.agent).lastAssistantSeq ?? -1) >= seed.length;
-      if (generated) {
-        await this.rememberVisibleSessions(key, [childId], true);
-      } else {
-        this.logger.warn(`clean retry ended without assistant message: key=${key} sessionId=${childId}`);
-      }
-    }).catch((err) => {
-      this.logger.warn(`clean retry completion check failed: key=${key} sessionId=${childId} err=${err instanceof Error ? err.message : String(err)}`);
-    });
-
-    this.logger.info(`clean retry forked: key=${key} parent=${parentId} sessionId=${childId} seedLength=${seed.length}`);
-    return { ok: true, sessionId: childId };
+    this.logger.info(`in-place retry started: key=${key} sessionId=${record.sessionId}`);
+    return { ok: true, sessionId: record.sessionId };
   }
 
   clearModelOverride(scope: ChatScope, peerId: string): void {
@@ -1006,13 +939,6 @@ export function selectSessionModelRoute(
   return current ?? logged ?? fallback;
 }
 
-interface RetryableTurn {
-  startIndex: number;
-  endIndex: number;
-  userEvent: SessionEventLike;
-  toolCount: number;
-}
-
 /** Keep only workspace sessions descending from this peer's known roots. */
 export function collectLineageSessionIds(
   headers: readonly SessionHeaderLike[],
@@ -1128,48 +1054,4 @@ export function lastConversationMessageAt(
     if (event.type === 'user/message' && (eventData(event).source as { kind?: string } | undefined)?.kind === 'user') return event.time;
   }
   return undefined;
-}
-
-/** Locate the latest completed user turn and its clean fork boundary. */
-export function findLastRetryableTurn(events: readonly SessionEventLike[]): RetryableTurn | undefined {
-  let endIndex = -1;
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    if (events[index]?.type === 'turn/end') {
-      endIndex = index;
-      break;
-    }
-  }
-  if (endIndex < 0) return undefined;
-
-  const turnId = eventData(events[endIndex]).turn;
-  let startIndex = -1;
-  for (let index = endIndex; index >= 0; index -= 1) {
-    const event = events[index];
-    if (event?.type === 'turn/start' && (turnId === undefined || eventData(event).turn === turnId)) {
-      startIndex = index;
-      break;
-    }
-  }
-  if (startIndex < 0) return undefined;
-
-  let userEvent: SessionEventLike | undefined;
-  let toolCount = 0;
-  let sawToolEvent = false;
-  for (let index = startIndex; index <= endIndex; index += 1) {
-    const event = events[index];
-    if (event?.type === 'tool/call') toolCount += 1;
-    if (event?.type === 'tool/call' || event?.type === 'tool/result') sawToolEvent = true;
-    if (event?.type !== 'user/message') continue;
-    const message = event.data ?? event.message;
-    const source = (message as { source?: { kind?: string } } | undefined)?.source;
-    if (source?.kind === 'user') userEvent = event;
-  }
-  if (!userEvent) return undefined;
-
-  return {
-    startIndex,
-    endIndex,
-    userEvent,
-    toolCount: Math.max(toolCount, sawToolEvent ? 1 : 0),
-  };
 }

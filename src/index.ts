@@ -14,7 +14,7 @@ import type { Logger } from './types.js';
 
 // ── Cordis 插件元数据 ──
 export const name = 'im-qqbot';
-export const inject = ['agents', 'sessions', 'sessionQuery', 'sessionPersistence', 'sessionProjections', 'sessionController'];
+export const inject = ['agents', 'sessions', 'sessionQuery', 'sessionPersistence', 'sessionProjections', 'sessionController', 'commands'];
 export const Config = ConfigSchema;
 
 export type { ImQQBotConfig } from './config.js';
