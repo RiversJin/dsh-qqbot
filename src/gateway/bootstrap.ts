@@ -8,7 +8,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import { QQBot } from '@tencent-connect/qqbot-nodejs';
 import type { MiddlewareContext } from '@tencent-connect/qqbot-nodejs';
 import { SessionManager, type DshAgentRegistry } from '../session/index.js';
-import { handleInbound, createOutboundHandler } from '../transport/index.js';
+import { handleInbound, createOutboundHandler, registerOutboundEvents } from '../transport/index.js';
 import type { ToolsRegistryLike } from '../transport/tool-presenter.js';
 import type { QQBotSender } from '../transport/outbound-buffer.js';
 import { buildUserAgent } from '../shared/index.js';
@@ -73,8 +73,7 @@ export async function bootstrapGateway(
   };
 
   const outboundHandler = createOutboundHandler(manager, sender, config, logger, toolsRegistry);
-  (ctx as unknown as { on(event: string, handler: (...args: unknown[]) => void): void })
-    .on('session/event', outboundHandler as (...args: unknown[]) => void);
+  registerOutboundEvents(ctx, outboundHandler);
 
   bot.on('error', (err: unknown) => {
     logger.error(`bot error: ${err instanceof Error ? err.message : String(err)}`);

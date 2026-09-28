@@ -4,6 +4,8 @@
  * 采用路由器模式：OutboundRouter 持有会话级状态（文本缓冲、工具调用记录），
  * 事件解析归一化在 events.ts，路由按事件类型分发到私有方法。
  */
+import type { Context } from '@deepseek-ai/cordis';
+import type {} from '@deepseek-ai/dsh-agent';
 import type { SessionManager, SessionRecord } from '../session/index.js';
 import type { ImQQBotConfig } from '../config.js';
 import type { Logger } from '../types.js';
@@ -68,6 +70,10 @@ class OutboundRouter {
     if (record === undefined) return;
 
     switch (event.type) {
+      case 'assistant/stream-discard':
+        this.buffers.get(session.header.id)?.cancel();
+        this.buffers.delete(session.header.id);
+        break;
       case 'assistant/chunk':
         this.onChunk(session.header.id, record, event);
         break;
@@ -144,7 +150,7 @@ class OutboundRouter {
     this.toolCalls.delete(event.callId);
     if (call === undefined) return;
 
-    if (event.error === undefined && !this.config.showToolResults) return;
+    if (!event.isError && !this.config.showToolResults) return;
 
     const text = formatToolResult(
       call.name,
@@ -233,4 +239,15 @@ export function createOutboundHandler(
 ): OutboundHandler {
   const router = new OutboundRouter(manager, bot, config, logger, toolsRegistry);
   return (session, event) => router.route(session, event);
+}
+
+/** V4 文本增量来自瞬态流；持久事件只承担最终消息和工具结果。 */
+export function registerOutboundEvents(ctx: Context, handler: OutboundHandler): void {
+  ctx.on('session/event', (session, event) => handler(session, event));
+  ctx.on('agent/assistant-stream', ({ agent, frame }) => {
+    if (frame.type === 'chunk') handler(agent.session, { type: 'assistant/chunk', data: { chunk: frame.chunk } });
+    else if (frame.type === 'end' && (frame.outcome.kind === 'abandoned' || frame.outcome.eventType === 'assistant/attempt')) {
+      handler(agent.session, { type: 'assistant/stream-discard', data: {} });
+    }
+  });
 }

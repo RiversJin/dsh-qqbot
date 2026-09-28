@@ -1,3 +1,6 @@
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap { 'plugin:dsh-im-qqbot': { kind: 'plugin:dsh-im-qqbot' } }
+}
 /**
  * 内置 qqbot_describe_image 视觉工具。
  *
@@ -126,7 +129,7 @@ async function callVision(
       { type: 'image', attachment: imageRef },
       { type: 'text', text: prompt },
     ],
-    source: { kind: 'plugin', plugin: 'dsh-im-qqbot' },
+    source: { kind: 'plugin:dsh-im-qqbot' },
   });
 
   const options: GenerateOptions = {

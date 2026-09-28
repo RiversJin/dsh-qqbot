@@ -3,10 +3,13 @@
  */
 import type { Context } from '@deepseek-ai/cordis';
 import type { ChatScope, ReplyTarget } from '../types.js';
-import type { ModelRoute } from '../model/types.js';
+import type { Agent, AgentHandle, AgentRegistry, AgentSetup as NativeAgentSetup } from '@deepseek-ai/dsh-agent';
+import type { SessionStore } from '@deepseek-ai/dsh-session';
+import type { SessionPersistence, SessionInspection } from '@deepseek-ai/dsh-session-persistence';
+import type PermissionPresetService from '@deepseek-ai/dsh-permission-presets';
 
 /** AgentSetup hook 类型 */
-export type AgentSetup = (agentCtx: Context) => Promise<void> | void;
+export type AgentSetup = NativeAgentSetup;
 
 /** dsh SessionEvent 简化类型（用于统计 token 用量 / 导出） */
 export interface SessionEventLike {
@@ -18,33 +21,12 @@ export interface SessionEventLike {
     content?: Array<{ type: string; text?: string }>;
     [key: string]: unknown;
   };
-  data?: {
-    source?: { kind?: string };
-    turn?: unknown;
-    [key: string]: unknown;
-  };
+  data?: unknown;
   [key: string]: unknown;
 }
 
-/** dsh Agent 简化接口 */
-export interface DshAgent {
-  readonly id: string;
-  readonly ctx: Context;
-  /** 当前生命周期状态（对齐 dsh Agent.status，用于判断是否正在生成） */
-  readonly status: 'idle' | 'running';
-  /** 底层 session（fork 时作为 source，events 用于统计/导出） */
-  readonly session: {
-    readonly id: string;
-    readonly events?: readonly SessionEventLike[];
-    readonly header?: SessionHeaderLike;
-    requestHeader?(): { config?: ModelRoute } | undefined;
-  };
-  cancel(cause: { kind: string }): void;
-  followup(message: unknown): void;
-  whenIdle(): Promise<void>;
-  /** 运行一个非 turn 维护任务（compact 等需要 idle 时串行执行的操作） */
-  runMaintenance<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T>;
-}
+/** 使用宿主公开类型，让接口变更在编译期暴露。 */
+export type DshAgent = Agent;
 
 /** compactNow 返回结果的精简视图（只取展示所需字段） */
 export interface CompactionResultLike {
@@ -70,15 +52,8 @@ export interface CompactOutcome {
   message?: string;
 }
 
-export interface DshAgentHandle {
-  agent: DshAgent;
-  dispose(): Promise<void>;
-}
-
-/** sessions 服务（fork 能力） */
-export interface SessionsService {
-  fork(source: unknown, boundary?: number): { events: readonly unknown[] };
-}
+export type DshAgentHandle = AgentHandle;
+export type SessionsService = SessionStore;
 
 /** Lightweight persisted session metadata used by QQ session selection. */
 export interface SessionHeaderLike {
@@ -90,15 +65,8 @@ export interface SessionHeaderLike {
   delegationDepth?: number;
 }
 
-export interface SessionInspectionLike {
-  meta: SessionHeaderLike;
-  events: readonly SessionEventLike[];
-}
-
-export interface SessionPersistenceLike {
-  list(signal?: AbortSignal): Promise<SessionHeaderLike[]>;
-  inspect(sessionId: string, signal?: AbortSignal): Promise<SessionInspectionLike>;
-}
+export type SessionInspectionLike = SessionInspection;
+export type SessionPersistenceLike = SessionPersistence;
 
 export interface SelectableSession {
   sessionId: string;
@@ -125,29 +93,8 @@ export interface SwitchSessionOutcome {
   message?: string;
 }
 
-export interface DshAgentRegistry {
-  /** 获取进程内已存活的 agent */
-  get(sessionId: string): DshAgent | undefined;
-  /** 从持久化存储恢复 session */
-  resume(options: {
-    resumeSessionId: string;
-    agentOptions?: { provider?: string; model?: string };
-    setup?: AgentSetup;
-  }): Promise<DshAgentHandle>;
-  /** 创建全新 session */
-  create(options: {
-    sessionId: string;
-    meta?: { cwd?: string; parentSession?: string; seedLength?: number; agentPreset?: string };
-    seed?: readonly unknown[];
-    agentOptions?: { provider?: string; model?: string };
-    setup?: AgentSetup;
-  }): Promise<DshAgentHandle>;
-}
-
-export interface PermissionPresetsLike {
-  set(session: unknown, preset: string): void;
-  current(events?: readonly SessionEventLike[]): string | undefined;
-}
+export type DshAgentRegistry = AgentRegistry;
+export type PermissionPresetsLike = PermissionPresetService;
 
 export interface WorkspaceRegistryLike {
   readonly archivedSessionIds?: readonly string[];
@@ -182,27 +129,6 @@ export interface LlmModelInfoLike {
 
 export interface LlmResolverLike {
   resolveModelInfo(provider: string, model: string): Promise<LlmModelInfoLike>;
-}
-
-export interface ApiProxyLike {
-  sessions: {
-    models(request: {
-      rpcId: string;
-      payload: { sessionId: string };
-    }): Promise<{
-      result:
-        | { ok: true; value: { current: ModelRoute } }
-        | { ok: false; error: { code: string; message: string } };
-    }>;
-    selectModel(request: {
-      rpcId: string;
-      payload: ModelRoute & { sessionId: string };
-    }): Promise<{
-      result:
-        | { ok: true; value: { selected: ModelRoute } }
-        | { ok: false; error: { code: string; message: string } };
-    }>;
-  };
 }
 
 /** agent-presets 服务接口（可选，部署中可能没有） */

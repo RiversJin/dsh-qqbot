@@ -13,7 +13,11 @@
  * 挂载 preset（工具集、prompt sections 等），实现场景化配置。
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { SessionId } from '@deepseek-ai/dsh-session';
+import { SessionId, SessionSeq, SessionLogOffset, buildForkSeed, deriveEventMessage, type SessionEvent } from '@deepseek-ai/dsh-session';
+import type {} from '@deepseek-ai/dsh-session-query';
+import type {} from '@deepseek-ai/dsh-api-session-controller';
+import { ReasoningEffortId } from '@deepseek-ai/dsh-llm';
+import { emptySummary, foldQqSummary, type QqSessionSummary } from './projection.js';
 import type { Context } from '@deepseek-ai/cordis';
 import type { ChatScope, Logger, ReplyTarget } from '../types.js';
 import type { ImQQBotConfig } from '../config.js';
@@ -44,7 +48,6 @@ import type {
   AttachmentsLike,
   NativeImageInput,
   LlmResolverLike,
-  ApiProxyLike,
 } from './types.js';
 
 /** ManualCompactionError 各 code 的友好提示（对齐 command-compact 的 expectedFailure 语义） */
@@ -93,12 +96,13 @@ export class SessionManager {
     }
   }
 
-  private getApiProxy(): ApiProxyLike | undefined {
-    try {
-      return this.ctx.get('apiProxy') as ApiProxyLike | undefined;
-    } catch {
-      return undefined;
-    }
+  private async readEvents(sessionId: string): Promise<readonly SessionEvent[]> {
+    return (await this.ctx.sessionQuery.readSession(SessionId(sessionId))).events;
+  }
+
+  private summary(agent: DshAgent | undefined): QqSessionSummary {
+    return agent === undefined ? emptySummary()
+      : this.ctx.sessionProjections.stateOf(agent.session, 'qqSessionSummary') ?? emptySummary();
   }
 
   /** Read Web's live session-local selection, then the durable route, then QQ defaults. */
@@ -111,24 +115,8 @@ export class SessionManager {
     pendingSelection: boolean;
   }> {
     const logged = sessionRequestRoute(record.agent);
-    let current: ModelRoute | undefined;
-    const apiProxy = this.getApiProxy();
-
-    if (apiProxy) {
-      try {
-        const response = await apiProxy.sessions.models({
-          rpcId: randomUUID(),
-          payload: { sessionId: record.sessionId },
-        });
-        if (response.result.ok) {
-          current = normalizeModelRoute(response.result.value.current);
-        } else {
-          this.logger.debug(`session model selection unavailable: sessionId=${record.sessionId} code=${response.result.error.code}`);
-        }
-      } catch (error) {
-        this.logger.debug(`session model selection lookup failed: sessionId=${record.sessionId} err=${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
+    const selection = this.ctx.sessionProjections.stateOf(record.agent.session, 'modelSelection');
+    const current = normalizeModelRoute(selection?.pending ?? selection?.lastUsed);
 
     return {
       route: selectSessionModelRoute(current, logged, fallback),
@@ -138,17 +126,10 @@ export class SessionManager {
 
   /** Read the latest durable request route before resuming a cold session. */
   private async inspectSessionRoute(sessionId: string): Promise<ModelRoute | undefined> {
-    let persistence: SessionPersistenceLike | undefined;
     try {
-      persistence = this.ctx.get('sessionPersistence') as SessionPersistenceLike | undefined;
-    } catch {
-      return undefined;
-    }
-    if (!persistence) return undefined;
-
-    try {
-      const inspected = await persistence.inspect(SessionId(sessionId));
-      return latestSessionModelRoute(inspected.events);
+      using observation = await this.ctx.sessionQuery.observeSession(SessionId(sessionId));
+      return normalizeModelRoute(observation.projections?.values.modelSelection?.next)
+        ?? latestSessionModelRoute(observation.events);
     } catch (error) {
       this.logger.debug(`session model route inspection failed: sessionId=${sessionId} err=${error instanceof Error ? error.message : String(error)}`);
       return undefined;
@@ -157,20 +138,9 @@ export class SessionManager {
 
   /** Copy a pending Web selection onto a newly-created retry branch. */
   private async applyPendingSelection(sessionId: string, route: ModelRoute): Promise<void> {
-    const apiProxy = this.getApiProxy();
-    if (!apiProxy) return;
-
-    try {
-      const response = await apiProxy.sessions.selectModel({
-        rpcId: randomUUID(),
-        payload: { sessionId, ...route },
-      });
-      if (!response.result.ok) {
-        this.logger.warn(`failed to copy pending model selection: sessionId=${sessionId} code=${response.result.error.code} err=${response.result.error.message}`);
-      }
-    } catch (error) {
-      this.logger.warn(`failed to copy pending model selection: sessionId=${sessionId} err=${error instanceof Error ? error.message : String(error)}`);
-    }
+    // Use the native controller to keep the live selection, durable log and Web
+    // state in sync. This replaces the previous apiProxy.selectModel call.
+    await this.ctx.sessionController.selectModel({ sessionId: SessionId(sessionId), ...route });
   }
 
   /** Enforce the connector-level permission policy on every QQ-owned session. */
@@ -189,7 +159,7 @@ export class SessionManager {
     }
 
     presets.set(agent.session, configured);
-    const effective = presets.current(agent.session.events);
+    const effective = presets.current(agent.session);
     if (effective !== configured) {
       throw new Error(`im-qqbot: failed to persist permission preset ${configured}; effective=${effective}`);
     }
@@ -369,9 +339,12 @@ export class SessionManager {
       return;
     }
 
-    let seed: readonly unknown[];
+    let seed: readonly SessionEvent[];
+    let inheritedEventCount: number;
     try {
-      seed = sessionsService.fork(record.agent.session).events;
+      const source = await this.readEvents(record.sessionId);
+      inheritedEventCount = source.length;
+      seed = source.length === 0 ? [] : buildForkSeed(source, SessionSeq(source.length - 1));
     } catch (err) {
       this.logger.warn(`fork failed, fallback to dispose: key=${key} err=${err instanceof Error ? err.message : String(err)}`);
       this.sessions.delete(key);
@@ -387,10 +360,11 @@ export class SessionManager {
     const created = await this.agents.create({
       sessionId: childId,
       seed,
+      inheritedEventCount: SessionLogOffset(inheritedEventCount),
       meta: {
         cwd: this.config.cwd || process.cwd(),
-        parentSession: record.sessionId,
-        seedLength: seed.length,
+        parentSession: SessionId(record.sessionId),
+        isSeeded: true,
         ...(composed.agentPreset ? { agentPreset: composed.agentPreset } : {}),
       },
       agentOptions: agentOptionsFor(route),
@@ -434,19 +408,21 @@ export class SessionManager {
     if (!record) return { ok: false, reason: 'no-session' };
 
     await record.agent.whenIdle();
-    const sourceEvents = [...(record.agent.session.events ?? [])];
+    const sourceEvents = await this.readEvents(record.sessionId);
     const retryable = findLastRetryableTurn(sourceEvents);
     if (!retryable) return { ok: false, reason: 'no-turn' };
     if (retryable.toolCount > 0 && !force) {
       return { ok: false, reason: 'tool-risk', toolCount: retryable.toolCount };
     }
 
-    const originalMessage = retryable.userEvent.data ?? retryable.userEvent.message;
-    if (!originalMessage) return { ok: false, reason: 'no-turn' };
+    const originalEvent = sourceEvents.find(event => event === retryable.userEvent);
+    if (originalEvent?.type !== 'user/message') return { ok: false, reason: 'no-turn' };
+    const originalMessage = originalEvent.data;
 
     const parentId = record.sessionId;
     const childId = SessionId(randomUUID());
-    const seed = sourceEvents.slice(0, retryable.startIndex);
+    const inheritedEventCount = retryable.startIndex;
+    const seed = inheritedEventCount === 0 ? [] : buildForkSeed(sourceEvents, SessionSeq(inheritedEventCount - 1));
     const resolvedRoute = await this.resolveSessionRoute(
       record,
       this.modelResolver.getEffectiveRoute(key),
@@ -456,10 +432,11 @@ export class SessionManager {
     const created = await this.agents.create({
       sessionId: childId,
       seed,
+      inheritedEventCount: SessionLogOffset(inheritedEventCount),
       meta: {
         cwd: this.config.cwd || process.cwd(),
-        parentSession: parentId,
-        seedLength: seed.length,
+        parentSession: SessionId(parentId),
+        isSeeded: true,
         ...(composed.agentPreset ? { agentPreset: composed.agentPreset } : {}),
       },
       ...(route ? { agentOptions: agentOptionsFor(route) } : {}),
@@ -486,9 +463,7 @@ export class SessionManager {
 
     created.agent.followup(structuredClone(originalMessage));
     void created.agent.whenIdle().then(async () => {
-      const generated = (created.agent.session.events ?? [])
-        .slice(seed.length)
-        .some((event) => event.type === 'assistant/message');
+      const generated = (this.summary(created.agent).lastAssistantSeq ?? -1) >= seed.length;
       if (generated) {
         await this.rememberVisibleSessions(key, [childId], true);
       } else {
@@ -533,7 +508,7 @@ export class SessionManager {
       model: route?.model,
       preset: record?.agentPreset,
       lastActivity: record?.lastActivity,
-      lastMessageAt: lastConversationMessageAt(record?.agent.session.events),
+      lastMessageAt: this.summary(record?.agent).lastMessageAt ?? undefined,
       messageCount: this.countMessages(record),
     };
   }
@@ -566,7 +541,7 @@ export class SessionManager {
     }
 
     try {
-      const headers = await persistence.list();
+      const headers = (await persistence.list()).map(snapshot => snapshot.header);
       const headerById = new Map(headers.map((header) => [String(header.id), header]));
       const ordinarySessionIds = new Set(
         headers
@@ -609,29 +584,22 @@ export class SessionManager {
         .map((sessionId) => ({ sessionId, header: headerById.get(sessionId) }));
 
       const inspected = await Promise.all(ordered.map(async ({ sessionId, header }): Promise<SelectableSession | undefined> => {
-        let events = this.agents.get(sessionId)?.session.events;
-        if (!events) {
-          try {
-            events = (await persistence!.inspect(SessionId(sessionId))).events;
-          } catch (error) {
+        let summary: QqSessionSummary | undefined;
+        const live = this.agents.get(SessionId(sessionId));
+        if (live) summary = this.summary(live);
+        else {
+          try { summary = (await this.readEvents(sessionId)).reduce(foldQqSummary, emptySummary()); }
+          catch (error) {
             this.logger.debug(`session title unavailable: sessionId=${sessionId} err=${error instanceof Error ? error.message : String(error)}`);
           }
         }
-        if (
-          effectiveVisibility === 'workspace'
-          && sessionId !== currentId
-          && events !== undefined
-          && !sessionHasVisibleContent(events)
-        ) {
-          return undefined;
-        }
-        const lastMessageAt = lastConversationMessageAt(events);
+        if (effectiveVisibility === 'workspace' && sessionId !== currentId && summary !== undefined && !summary.hasContent) return undefined;
         return {
           sessionId,
           ...(header?.createdAt !== undefined ? { createdAt: header.createdAt } : {}),
-          ...(lastMessageAt !== undefined ? { lastMessageAt } : {}),
+          ...(summary?.lastMessageAt != null ? { lastMessageAt: summary.lastMessageAt } : {}),
           ...(header?.parentSession ? { parentSession: String(header.parentSession) } : {}),
-          ...(latestSessionTitle(events) ? { title: latestSessionTitle(events) } : {}),
+          ...(summary?.title ? { title: summary.title } : {}),
           current: sessionId === currentId,
         };
       }));
@@ -723,55 +691,26 @@ export class SessionManager {
 
   getTokenUsage(scope: ChatScope, peerId: string): TokenUsageStats {
     const record = this.getSessionRecord(scope, peerId);
-    const stats: TokenUsageStats = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-
-    const events = record?.agent.session.events;
-    if (!events) return stats;
-
-    for (const event of events) {
-      if (event.type !== 'assistant/message' || !event.usage) continue;
-      stats.input += event.usage.input ?? 0;
-      stats.output += event.usage.output ?? 0;
-      stats.cacheRead += event.usage.cacheRead ?? 0;
-      stats.cacheWrite += event.usage.cacheWrite ?? 0;
-    }
-
-    return stats;
+    return { ...this.summary(record?.agent).usage };
   }
 
-  exportMarkdown(scope: ChatScope, peerId: string): string {
+  async exportMarkdown(scope: ChatScope, peerId: string): Promise<string> {
     const record = this.getSessionRecord(scope, peerId);
     if (!record) return '';
-
-    const events = record.agent.session.events;
-    if (!events || events.length === 0) return '';
-
+    const events = await this.readEvents(record.sessionId);
+    if (events.length === 0) return '';
     const lines: string[] = [`# QQ 会话导出\n`, `> session: ${record.sessionId}\n`];
-
     for (const event of events) {
-      if (event.type === 'user/message') {
-        const text = extractMessageText(event.message);
-        if (text) lines.push(`## 用户\n\n${text}\n`);
-      } else if (event.type === 'assistant/message') {
-        const text = extractMessageText(event.message);
-        if (text) lines.push(`## 助手\n\n${text}\n`);
-      }
+      const message = deriveEventMessage(event);
+      if (message?.role !== 'user' && message?.role !== 'assistant') continue;
+      const text = message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n').trim();
+      if (text) lines.push(`## ${message.role === 'user' ? '用户' : '助手'}\n\n${text}\n`);
     }
-
     return lines.join('\n');
   }
 
   private countMessages(record: SessionRecord | undefined): number {
-    const events = record?.agent.session.events;
-    if (!events) return 0;
-
-    let count = 0;
-    for (const event of events) {
-      if (event.type === 'user/message' || event.type === 'assistant/message') {
-        count += 1;
-      }
-    }
-    return count;
+    return this.summary(record?.agent).messageCount;
   }
 
   // ── Session 生命周期管理 ──
@@ -1025,8 +964,8 @@ function sameModelRoute(left: ModelRoute | undefined, right: ModelRoute | undefi
     && left.reasoningEffort === right.reasoningEffort;
 }
 
-function agentOptionsFor(route: ModelRoute): { provider: string; model: string } {
-  return { provider: route.provider, model: route.model };
+function agentOptionsFor(route: ModelRoute) {
+  return { provider: route.provider, model: route.model, ...(route.reasoningEffort ? { reasoningEffort: ReasoningEffortId(route.reasoningEffort) } : {}) };
 }
 
 function sessionRequestRoute(agent: DshAgent): ModelRoute | undefined {
@@ -1036,7 +975,11 @@ function sessionRequestRoute(agent: DshAgent): ModelRoute | undefined {
   } catch {
     // Fall through to the durable events for lightweight/mocked session views.
   }
-  return latestSessionModelRoute(agent.session.events ?? []);
+  return undefined;
+}
+
+function eventData(event: SessionEventLike | undefined): Record<string, unknown> {
+  return typeof event?.data === 'object' && event.data !== null ? event.data as Record<string, unknown> : {};
 }
 
 /** Last durable request route recorded by DSH for this session. */
@@ -1046,7 +989,7 @@ export function latestSessionModelRoute(
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
     if (event?.type !== 'request/header') continue;
-    const dataHeader = event.data?.header as { config?: unknown } | undefined;
+    const dataHeader = eventData(event).header as { config?: unknown } | undefined;
     const topHeader = event.header as { config?: unknown } | undefined;
     const route = normalizeModelRoute(dataHeader?.config ?? topHeader?.config);
     if (route) return route;
@@ -1173,18 +1116,6 @@ export function sortSessionsByRecentActivity(
   });
 }
 
-/** Last durable title wins; absent titles stay absent rather than inventing one. */
-function latestSessionTitle(events: readonly SessionEventLike[] | undefined): string | undefined {
-  if (!events) return undefined;
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    if (event?.type !== 'session/title') continue;
-    const title = event.data?.title;
-    if (typeof title === 'string' && title.trim()) return title.trim();
-  }
-  return undefined;
-}
-
 /** Latest real user/assistant message, excluding plugin-generated context rows. */
 export function lastConversationMessageAt(
   events: readonly SessionEventLike[] | undefined,
@@ -1194,7 +1125,7 @@ export function lastConversationMessageAt(
     const event = events[index];
     if (!event || !Number.isFinite(event.time)) continue;
     if (event.type === 'assistant/message') return event.time;
-    if (event.type === 'user/message' && event.data?.source?.kind === 'user') return event.time;
+    if (event.type === 'user/message' && (eventData(event).source as { kind?: string } | undefined)?.kind === 'user') return event.time;
   }
   return undefined;
 }
@@ -1210,11 +1141,11 @@ export function findLastRetryableTurn(events: readonly SessionEventLike[]): Retr
   }
   if (endIndex < 0) return undefined;
 
-  const turnId = events[endIndex]?.data?.turn;
+  const turnId = eventData(events[endIndex]).turn;
   let startIndex = -1;
   for (let index = endIndex; index >= 0; index -= 1) {
     const event = events[index];
-    if (event?.type === 'turn/start' && (turnId === undefined || event.data?.turn === turnId)) {
+    if (event?.type === 'turn/start' && (turnId === undefined || eventData(event).turn === turnId)) {
       startIndex = index;
       break;
     }
@@ -1241,20 +1172,4 @@ export function findLastRetryableTurn(events: readonly SessionEventLike[]): Retr
     userEvent,
     toolCount: Math.max(toolCount, sawToolEvent ? 1 : 0),
   };
-}
-
-/** 从消息对象中提取纯文本（用于导出/统计） */
-function extractMessageText(
-  message: SessionEventLike['message'],
-): string {
-  const blocks = message?.content;
-  if (!blocks || !Array.isArray(blocks)) return '';
-
-  const parts: string[] = [];
-  for (const block of blocks) {
-    if (block.type === 'text' && block.text) {
-      parts.push(block.text);
-    }
-  }
-  return parts.join('\n').trim();
 }

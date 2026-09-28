@@ -9,7 +9,7 @@
 /** 原始 dsh 事件（弱类型，来自 ctx.on('session/event')） */
 export interface RawSessionEvent {
   type: string;
-  data: Record<string, unknown>;
+  data: unknown;
 }
 
 /** turn/end 事件的 reason 结构（兼容 error/failure/顶层 message 三种形态） */
@@ -45,6 +45,7 @@ export interface ToolCallEvent {
 export interface ToolResultEvent {
   type: 'tool/result';
   callId: string;
+  isError: boolean;
   error?: { name: string; code: string };
   /** 原始 data 透传给 presenter 做结构化展示 */
   raw: Record<string, unknown>;
@@ -69,7 +70,8 @@ export type OutboundEvent =
   | ToolCallEvent
   | ToolResultEvent
   | CompactionPruneEvent
-  | TurnEndEvent;
+  | TurnEndEvent
+  | { type: 'assistant/stream-discard' };
 
 /**
  * 解析原始事件为强类型
@@ -78,6 +80,7 @@ export type OutboundEvent =
  */
 export function parseEvent(raw: RawSessionEvent): OutboundEvent | undefined {
   switch (raw.type) {
+    case 'assistant/stream-discard': return { type: 'assistant/stream-discard' };
     case 'assistant/chunk': {
       const chunk = (raw.data as { chunk?: { type?: string; text?: string } }).chunk;
       if (chunk === undefined || chunk.type !== 'text-delta' || !chunk.text) return undefined;
@@ -97,10 +100,10 @@ export function parseEvent(raw: RawSessionEvent): OutboundEvent | undefined {
     }
 
     case 'tool/result': {
-      const data = raw.data as { message?: { source?: { callId?: string } }; error?: { name: string; code: string } };
-      const callId = data.message?.source?.callId;
+      const data = raw.data as { message?: { toolCallId?: string; isError?: boolean; source?: { callId?: string } }; error?: { name: string; code: string } };
+      const callId = data.message?.toolCallId ?? data.message?.source?.callId;
       if (!callId) return undefined;
-      return { type: 'tool/result', callId, error: data.error, raw: raw.data };
+      return { type: 'tool/result', callId, isError: data.message?.isError === true || data.error !== undefined, error: data.error, raw: raw.data as Record<string, unknown> };
     }
 
     case 'turn/end': {

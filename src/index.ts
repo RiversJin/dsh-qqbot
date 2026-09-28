@@ -7,21 +7,22 @@
 import type { Context } from '@deepseek-ai/cordis';
 import { ConfigSchema, type ImQQBotConfig } from './config.js';
 import { bootstrapGateway } from './gateway/index.js';
-import type { DshAgentRegistry } from './session/index.js';
+import { registerQqSessionSummary } from './session/projection.js';
 import { getProfileDir, resolveEnv } from './shared/index.js';
 import { runQrSetup, persistCredentialsToProfile } from './setup.js';
 import type { Logger } from './types.js';
 
 // ── Cordis 插件元数据 ──
 export const name = 'im-qqbot';
-export const inject = ['agents', 'apiProxy'];
+export const inject = ['agents', 'sessions', 'sessionQuery', 'sessionPersistence', 'sessionProjections', 'sessionController'];
 export const Config = ConfigSchema;
 
 export type { ImQQBotConfig } from './config.js';
 
 // ── 插件主体 ──
 export async function apply(ctx: Context, config: ImQQBotConfig): Promise<void> {
-  const agents = (ctx as unknown as Record<string, unknown>).agents as DshAgentRegistry;
+  const agents = ctx.agents;
+  registerQqSessionSummary(ctx);
   const logger: Logger = ((ctx as unknown as Record<string, unknown>).logger as Logger) ?? console;
 
   console.log('[im-qqbot] apply() called');

@@ -1,3 +1,4 @@
+import type { ContentBlock } from '@deepseek-ai/dsh-llm';
 /**
  * 工具调用结果 → Markdown 格式化
  *
@@ -16,7 +17,8 @@ export interface ToolsRegistryLike {
 /** 工具结果事件数据（tool/result） */
 export interface ToolResultData {
   message: {
-    content: Array<{ type: string; content?: unknown; isError?: boolean }>;
+    content: readonly ContentBlock[];
+    isError?: boolean;
     source: { callId: string };
   };
   error?: { name: string; code: string };
@@ -49,6 +51,10 @@ export function formatToolResult(
     return `❌ 工具 \`${name}\` 执行失败\n\`${data.error.name}: ${data.error.code}\``;
   }
 
+  if (data.message.isError === true) {
+    return `❌ 工具 \`${name}\` 执行失败\n${truncate(textOf(data.message.content))}`;
+  }
+
   // 2. 尝试工具自定义视图（presentResult）
   const view = presentResultView(name, rawArgs, data, toolsRegistry, agent);
   if (view) {
@@ -57,8 +63,7 @@ export function formatToolResult(
   }
 
   // 3. fallback raw text
-  const block = data.message.content[0];
-  const result = block !== undefined && block.type === 'tool-result' ? textOf(block.content) : '';
+  const result = textOf(data.message.content);
   if (!result) return null;
 
   return `🔧 \`${name}\` 完成\n${truncate(result)}`;
@@ -78,11 +83,10 @@ function presentResultView(
     const tool = toolsRegistry.get(name, agent);
     if (tool?.presentResult === undefined) return undefined;
 
-    const block = data.message.content[0];
-    const content = block !== undefined && block.type === 'tool-result' ? block.content : [];
+    const content = data.message.content;
     return tool.presentResult(JSON.parse(rawArgs), {
       content,
-      isError: block?.isError === true,
+      isError: data.message.isError === true,
       ...(data.meta !== undefined ? { meta: data.meta } : {}),
     }) as ToolResultView | undefined;
   } catch {

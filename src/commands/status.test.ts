@@ -22,7 +22,7 @@ describe('/bot-status', () => {
         sessionId: 'session-252de13c-0d5b-4188-a3c7-d400c4d0655b',
         provider: 'kimi-coding',
         model: 'k3',
-        preset: 'qiyue',
+        preset: 'companion',
         messageCount: 12,
         lastMessageAt: Date.now() - 3_600_000,
         lastActivity: Date.now() - 10_000,
