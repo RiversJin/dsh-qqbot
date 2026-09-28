@@ -9,7 +9,7 @@
  *   - qqbot：插件自身特有（ping/version/status/help）
  */
 import type { CommandDeps, CategorizedCommand } from './types.js';
-import { newCommand } from './session.js';
+import { newCommand, compactCommand } from './session.js';
 import { modelCommand } from './model.js';
 import { statusCommand } from './status.js';
 import { helpCommand } from './help.js';
@@ -25,6 +25,7 @@ export function buildCommandList(deps: CommandDeps): CategorizedCommand[] {
     // 通用能力（底层 agent）
     newCommand(deps),
     retryCommand(deps),
+    compactCommand(deps),
     sessionsCommand(deps),
     switchCommand(deps),
     modelCommand(deps),

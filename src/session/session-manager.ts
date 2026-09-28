@@ -41,7 +41,6 @@ import type {
   SelectableSession,
   SessionListOutcome,
   SwitchSessionOutcome,
-  CompactionServiceLike,
   CompactOutcome,
   PermissionPresetsLike,
   WorkspaceRegistryLike,
@@ -50,15 +49,6 @@ import type {
   NativeImageInput,
   LlmResolverLike,
 } from './types.js';
-
-/** ManualCompactionError 各 code 的友好提示（对齐 command-compact 的 expectedFailure 语义） */
-const COMPACTION_ERROR_HINTS: Record<string, string> = {
-  busy: '压缩服务忙，请稍后重试',
-  cancelled: '压缩已取消',
-  changed: '历史在压缩过程中发生变化，请重试',
-  commit: '压缩提交失败',
-  persistence: '压缩完成但保存失败',
-};
 
 export class SessionManager {
   private sessions = new Map<string, SessionRecord>();
@@ -807,54 +797,24 @@ export class SessionManager {
     this.logger.info(`session reset: key=${key} nextSessionId=${nextSessionId}`);
   }
 
-  /**
-   * 原地压缩当前会话历史（保留 sessionId，用摘要替换旧历史）。
-   *
-   * 需通过 agentPresets.serviceFor(agent, 'compaction') 解析；未挂载时优雅降级。
-   * 这是「压缩上下文」的语义，区别于 remove() 的「换新会话」。
-   */
+  /** Reuse the preset's native command and its configured compaction backend. */
   async compact(scope: ChatScope, peerId: string): Promise<CompactOutcome> {
-    const key = this.sessionKey(scope, peerId);
-    const record = this.sessions.get(key);
+    const record = this.sessions.get(this.sessionKey(scope, peerId));
     if (!record) return { ok: false, reason: 'no-session' };
     if (record.agent.status !== 'idle') return { ok: false, reason: 'busy' };
-
-    let compaction: CompactionServiceLike | undefined;
     try {
-      const presets = this.ctx.get('agentPresets') as AgentPresetsLike | undefined;
-      compaction = (presets?.serviceFor(record.agent, 'compaction') ?? this.ctx.get('compaction')) as CompactionServiceLike | undefined;
-    } catch {
-      compaction = undefined;
-    }
-    if (!compaction) return { ok: false, reason: 'unavailable' };
-
-    const route = (await this.resolveSessionRoute(
-      record,
-      this.modelResolver.getEffectiveRoute(key),
-    )).route;
-    const agentCtx = {
-      session: record.agent.session,
-      options: { provider: route?.provider, model: route?.model },
-      runMaintenance: record.agent.runMaintenance.bind(record.agent),
-    };
-
-    try {
-      const result = await compaction.compactNow(agentCtx, new AbortController().signal);
-      if (result === null) return { ok: true, shadowed: 0, tokens: 0 };
-      return { ok: true, shadowed: result.shadowedSeqs.length, tokens: result.shadowedTokenCount };
-    } catch (err) {
-      const code = (err as { code?: string } | null)?.code;
-      // summary = 摘要没有更小 = 历史不足以压缩，属正常结果而非失败
-      if (code === 'summary') {
-        return { ok: true, shadowed: 0, tokens: 0 };
+      const execution = await this.ctx.commands.execute(
+        record.agent, '/compact', [], new AbortController().signal,
+      );
+      if (!execution) return { ok: false, reason: 'unavailable' };
+      if (execution.result.kind !== 'success') {
+        return { ok: false, reason: 'failed', message: execution.result.text ?? '无法压缩当前会话' };
       }
-      // 其他 ManualCompactionError 预期失败，给友好文案（debug 记录，不 warn 刷屏）
-      if (code !== undefined && code in COMPACTION_ERROR_HINTS) {
-        this.logger.debug(`compact declined: key=${key} code=${code}`);
-        return { ok: false, reason: 'failed', message: COMPACTION_ERROR_HINTS[code] };
-      }
-      const message = err instanceof Error ? err.message : String(err);
-      this.logger.warn(`compact failed: key=${key} err=${message}`);
+      record.lastActivity = Date.now();
+      return { ok: true, message: execution.result.text };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`compact failed: sessionId=${record.sessionId} err=${message}`);
       return { ok: false, reason: 'failed', message };
     }
   }

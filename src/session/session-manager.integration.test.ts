@@ -115,6 +115,36 @@ describe('QQ session management against V4 sessions', () => {
     expect(f.manager.getSessionRecord('c2c', 'test-peer')).toBe(record);
   });
 
+  it('dispatches compact on the real current agent without forking or prompting', async () => {
+    const f = fixture();
+    const record = await f.manager.getOrCreate('c2c', 'test-peer', 'sender', { scope: 'c2c', targetId: 'test-peer' });
+    f.ctx.commands.execute.mockResolvedValue({ result: { kind: 'success', text: 'Compacted 8 history items (~1234 tokens).' } });
+    expect(await f.manager.compact('c2c', 'test-peer')).toEqual({ ok: true, message: 'Compacted 8 history items (~1234 tokens).' });
+    expect(f.ctx.commands.execute).toHaveBeenCalledWith(record.agent, '/compact', [], expect.any(AbortSignal));
+    expect(record.agent.followup).not.toHaveBeenCalled();
+    expect(f.agents.create).toHaveBeenCalledTimes(1);
+    expect(f.services.sessions.fork).not.toHaveBeenCalled();
+  });
+
+  it('does not turn a failed compaction into a successful no-op', async () => {
+    const f = fixture();
+    await f.manager.getOrCreate('c2c', 'test-peer', 'sender', { scope: 'c2c', targetId: 'test-peer' });
+    f.ctx.commands.execute.mockResolvedValue({ result: { kind: 'error', text: 'Compaction could not produce a useful summary.' } });
+    expect(await f.manager.compact('c2c', 'test-peer')).toEqual({ ok: false, reason: 'failed', message: 'Compaction could not produce a useful summary.' });
+  });
+
+  it('rejects busy agents before dispatch and reports an unavailable command', async () => {
+    const f = fixture();
+    expect(await f.manager.compact('c2c', 'test-peer')).toEqual({ ok: false, reason: 'no-session' });
+    const record = await f.manager.getOrCreate('c2c', 'test-peer', 'sender', { scope: 'c2c', targetId: 'test-peer' });
+    Object.assign(record.agent, { status: 'running' });
+    expect(await f.manager.compact('c2c', 'test-peer')).toEqual({ ok: false, reason: 'busy' });
+    expect(f.ctx.commands.execute).not.toHaveBeenCalled();
+    Object.assign(record.agent, { status: 'idle' });
+    f.ctx.commands.execute.mockResolvedValue(undefined as never);
+    expect(await f.manager.compact('c2c', 'test-peer')).toEqual({ ok: false, reason: 'unavailable' });
+  });
+
   it('model switching creates only the intended child with the full inherited prefix', async () => {
     const f = fixture();
     const record = await f.manager.getOrCreate('c2c', 'test-peer', 'sender', { scope: 'c2c', targetId: 'test-peer' });

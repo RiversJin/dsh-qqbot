@@ -28,27 +28,10 @@ export interface SessionEventLike {
 /** 使用宿主公开类型，让接口变更在编译期暴露。 */
 export type DshAgent = Agent;
 
-/** compactNow 返回结果的精简视图（只取展示所需字段） */
-export interface CompactionResultLike {
-  shadowedSeqs: readonly number[];
-  shadowedTokenCount: number;
-}
-
-/** ctx.compaction 服务的最小接口（compactNow 依赖，可选注入） */
-export interface CompactionServiceLike {
-  compactNow(
-    agent: unknown,
-    signal: AbortSignal,
-    sourceCommandId?: string,
-  ): Promise<CompactionResultLike | null>;
-}
-
 /** compact 操作结果 */
 export interface CompactOutcome {
   ok: boolean;
   reason?: 'no-session' | 'busy' | 'unavailable' | 'failed';
-  shadowed?: number;
-  tokens?: number;
   message?: string;
 }
 
