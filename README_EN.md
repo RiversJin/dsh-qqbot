@@ -64,8 +64,7 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 | `preset` | string | - | Agent preset id |
 | `permissionPreset` | string | - | DSH permission preset enforced for QQ sessions |
 | `workspacePath` | string | - | DSH Workspace path that owns QQ sessions |
-| `timestampTimeZone` | string | `Asia/Singapore` | IANA time zone for model-visible message timestamps |
-| `timestampIntervalMinutes` | number | `30` | Minimum timestamp interval; day changes always emit one |
+| `timestampTimeZone` | string | `Asia/Singapore` | IANA time zone for session list timestamps |
 | `visibleSessionLimit` | number | `16` | Visible session branches retained per QQ peer |
 | `sessionVisibility` | `lineage` \| `workspace` | `lineage` | Limit `/sessions` to the current QQ lineage or expose all ordinary, unarchived sessions in the configured Workspace |
 | `cwd` | string | `process.cwd()` | Agent working directory |

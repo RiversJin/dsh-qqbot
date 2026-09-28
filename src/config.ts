@@ -55,10 +55,8 @@ export interface ImQQBotConfig {
   permissionPreset?: string;
   /** QQ 会话所属的 DSH Workspace 路径 */
   workspacePath?: string;
-  /** 注入消息时间戳所使用的 IANA 时区 */
+  /** 会话列表所使用的 IANA 时区 */
   timestampTimeZone: string;
-  /** 模型可见时间戳的最短间隔（分钟） */
-  timestampIntervalMinutes: number;
   /** 每个 QQ peer 在 DSH 中保留的可见会话分支数 */
   visibleSessionLimit: number;
   /** /sessions 可见范围：仅当前 QQ 分支，或整个配置的 Workspace */
@@ -103,8 +101,7 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
   preset: Schema.string().description('Agent preset id'),
   permissionPreset: Schema.string().description('Permission preset forced onto QQ sessions'),
   workspacePath: Schema.string().description('Workspace path that owns QQ sessions'),
-  timestampTimeZone: Schema.string().default('Asia/Singapore').description('IANA time zone used for message timestamps'),
-  timestampIntervalMinutes: Schema.number().default(30).description('Minimum interval between model-visible message timestamps'),
+  timestampTimeZone: Schema.string().default('Asia/Singapore').description('IANA time zone used for session list timestamps'),
   visibleSessionLimit: Schema.number().default(16).description('Maximum visible connector sessions retained per peer'),
   sessionVisibility: Schema.union(['lineage', 'workspace']).default('lineage').description('Session picker scope: current QQ lineage or configured Workspace'),
   cwd: Schema.string().description('Agent working directory'),

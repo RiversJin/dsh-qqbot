@@ -64,8 +64,7 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 | `preset` | string | - | Agent preset id |
 | `permissionPreset` | string | - | QQ 会话强制使用的 DSH 权限预设 |
 | `workspacePath` | string | - | QQ 会话所属的 DSH Workspace 路径 |
-| `timestampTimeZone` | string | `Asia/Singapore` | 模型可见消息时间戳使用的 IANA 时区 |
-| `timestampIntervalMinutes` | number | `30` | 时间戳最短注入间隔；跨天时总会注入 |
+| `timestampTimeZone` | string | `Asia/Singapore` | 会话列表时间显示使用的 IANA 时区 |
 | `visibleSessionLimit` | number | `16` | 每个 QQ peer 保留的可见会话分支数 |
 | `sessionVisibility` | `lineage` \| `workspace` | `lineage` | `/sessions` 仅显示当前 QQ 分支，或显示配置 Workspace 中全部普通未归档会话 |
 | `cwd` | string | `process.cwd()` | Agent 工作目录 |
