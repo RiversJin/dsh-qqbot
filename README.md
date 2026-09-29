@@ -6,6 +6,12 @@
 
 ## 架构
 
+原生 `schedule` 触发的回复会按会话保存的 QQ 收件目标主动发送，闲置回收和重启后仍可投递。
+收件目标保存在 `~/.dsh-qqbot/delivery-routes-<appId>.json`，不保存或复用旧消息 ID；
+首次升级会迁移已有的当前 QQ 会话映射。网页分叉不会自动继承 QQ 收件目标。
+文件另保留最近 100 次 QQ 发送结果：`accepted` 表示 QQ API 接受，`failed` 记录发送错误；
+原生调度器的 `delivered` 仅表示提醒进入 DSH 会话。已错过的回复不会自动补发。
+
 ```
 QQ 用户 → QQ WebSocket → dsh-im-qqbot → ctx.agents → dsh agent loop → LLM
                                  ↑                           │

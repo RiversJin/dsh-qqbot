@@ -22,7 +22,7 @@ export class IdleEvictor {
   check(): void {
     const now = Date.now();
     for (const [key, record] of this.sessions) {
-      if (now - record.lastActivity > this.timeoutMs) {
+      if (record.agent.status === 'idle' && now - record.lastActivity > this.timeoutMs) {
         this.onEvict(key, record);
       }
     }

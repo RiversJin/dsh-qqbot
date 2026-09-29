@@ -6,6 +6,13 @@ A QQ Bot IM plugin for [deepseek-harness](https://github.com/deepseek-ai/deepsee
 
 ## Architecture
 
+Replies triggered by native `schedule` use an exact-session QQ destination that survives idle eviction and restarts.
+Destinations are stored in `~/.dsh-qqbot/delivery-routes-<appId>.json` without passive reply IDs.
+Existing current QQ selections are migrated on upgrade; arbitrary Web forks do not inherit a recipient.
+The file retains the latest 100 QQ delivery receipts: `accepted` means the QQ API accepted the send,
+and `failed` records a transport error. Native scheduler `delivered` only means admission to DSH.
+Previously missed replies are not automatically resent.
+
 ```
 QQ User → QQ WebSocket → dsh-im-qqbot → ctx.agents → dsh agent loop → LLM
                                  ↑                           │

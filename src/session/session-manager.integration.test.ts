@@ -21,6 +21,12 @@ vi.mock('../model/model-resolver.js', () => ({ ModelResolver: class {
 } }));
 
 const managers: SessionManager[] = [];
+vi.mock('./delivery-routes.js', () => ({ DeliveryRoutes: class {
+  routes = new Map();
+  remember(id: string, target: unknown) { this.routes.set(id, target); }
+  get(id: string) { return this.routes.get(id); }
+  record() {}
+} }));
 afterEach(async () => { await Promise.all(managers.splice(0).map(manager => manager.disposeAll())); });
 
 function fixture() {

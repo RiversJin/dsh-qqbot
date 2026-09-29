@@ -8,7 +8,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-agent';
 import type { SessionManager, SessionRecord } from '../session/index.js';
 import type { ImQQBotConfig } from '../config.js';
-import type { Logger } from '../types.js';
+import type { Logger, ReplyTarget } from '../types.js';
 import { chunkMarkdownText } from './chunker.js';
 import { OutboundBuffer, type QQBotSender } from './outbound-buffer.js';
 import { formatToolResult, type ToolsRegistryLike, type ToolResultData } from './tool-presenter.js';
@@ -52,6 +52,7 @@ class OutboundRouter {
   private readonly toolCalls = new Map<string, ToolCallRecord>();
   private readonly prunedResults = new Map<string, number>();
   private readonly deliveries = new Map<string, Promise<void>>();
+  private readonly scheduledTargets = new Map<string, ReplyTarget | undefined>();
 
   public constructor(
     private readonly manager: SessionManager,
@@ -63,8 +64,35 @@ class OutboundRouter {
 
   /** 事件分发入口 */
   public route(session: SessionLike, raw: RawSessionEvent): void {
+    const sessionId = session.header.id;
+    if (raw.type === 'turn/start') this.scheduledTargets.delete(sessionId);
+    if (raw.type === 'user/message' && (raw.data as { source?: { kind?: string } }).source?.kind === 'schedule') {
+      const target = this.manager.getScheduledReplyTarget(sessionId);
+      // Web-only sessions and arbitrary forks have no QQ destination.
+      if (target === undefined) return;
+      this.scheduledTargets.set(sessionId, target);
+      this.buffers.get(sessionId)?.cancel();
+      this.buffers.delete(sessionId);
+      this.prunedResults.delete(sessionId);
+      return;
+    }
     const event = parseEvent(raw);
     if (event === undefined) return;
+
+    // Schedule turns have their own durable destination. Consume their stream
+    // here even when a live QQ record exists, avoiding duplicate/passive sends.
+    if (this.scheduledTargets.has(sessionId)) {
+      const target = this.scheduledTargets.get(sessionId);
+      if (event.type === 'assistant/message' && raw.surfaceOp === 'append' && typeof raw.seq === 'number') {
+        const text = event.content.filter(b => b.type === 'text').map(b => b.text ?? '').join('\n');
+        if (text.trim()) {
+          const seq = raw.seq;
+          this.enqueueDelivery(sessionId, () => this.sendScheduled(sessionId, seq, target, text));
+        }
+      }
+      if (event.type === 'turn/end') this.scheduledTargets.delete(sessionId);
+      return;
+    }
 
     const record = this.manager.findBySessionId(session.header.id);
     if (record === undefined) return;
@@ -92,6 +120,23 @@ class OutboundRouter {
       case 'turn/end':
         this.onTurnEnd(session.header.id, record, event);
         break;
+    }
+  }
+
+  private async sendScheduled(sessionId: string, seq: number, target: ReplyTarget | undefined, text: string): Promise<void> {
+    let chunksAccepted = 0;
+    try {
+      if (!target) throw new Error('No persisted QQ destination for scheduled session');
+      for (const chunk of chunkMarkdownText(text, this.config.textChunkLimit)) {
+        await this.bot.sendMarkdown(target, chunk);
+        chunksAccepted++;
+      }
+      this.manager.recordScheduledDelivery({ sessionId, seq, at: new Date().toISOString(), status: 'accepted', chunksAccepted });
+      this.logger.info(`QQ scheduled reply accepted: sessionId=${sessionId} seq=${seq} chunks=${chunksAccepted}`);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.manager.recordScheduledDelivery({ sessionId, seq, at: new Date().toISOString(), status: 'failed', chunksAccepted, error: detail });
+      this.logger.error(`QQ scheduled reply failed: sessionId=${sessionId} seq=${seq}: ${detail}`);
     }
   }
 

@@ -25,6 +25,7 @@ import type { ImQQBotConfig } from '../config.js';
 import { ModelResolver } from '../model/model-resolver.js';
 import type { ModelRoute, ModelEntry } from '../model/types.js';
 import { IdleEvictor } from './idle-evictor.js';
+import { DeliveryRoutes, type DeliveryReceipt } from './delivery-routes.js';
 import type {
   SessionEventLike,
   DshAgent,
@@ -55,6 +56,7 @@ export class SessionManager {
   private retentionTasks = new Map<string, Promise<void>>();
   private readonly evictor: IdleEvictor;
   private readonly modelResolver: ModelResolver;
+  private readonly deliveryRoutes: DeliveryRoutes;
 
   constructor(
     private readonly ctx: Context,
@@ -63,6 +65,7 @@ export class SessionManager {
     private readonly logger: Logger,
   ) {
     this.modelResolver = new ModelResolver(ctx, config, logger);
+    this.deliveryRoutes = new DeliveryRoutes(config.appId, logger);
 
     this.evictor = new IdleEvictor(
       this.sessions,
@@ -367,6 +370,7 @@ export class SessionManager {
     record.agentPreset = composed.agentPreset;
     record.lastActivity = Date.now();
 
+    this.deliveryRoutes.remember(childId, record.replyTarget);
     void oldHandle.dispose().catch(() => {});
     await this.rememberVisibleSessions(key, [parentId, childId]);
     this.logger.info(`model switched via fork: key=${key} → ${route.provider}/${route.model} sessionId=${childId}`);
@@ -563,6 +567,7 @@ export class SessionManager {
     if (previous?.sessionId === target.sessionId) {
       previous.replyTarget = replyTarget;
       previous.lastActivity = Date.now();
+      this.deliveryRoutes.remember(previous.sessionId, replyTarget);
       return { ok: true, session: { ...target, current: true } };
     }
 
@@ -597,6 +602,7 @@ export class SessionManager {
 
       this.modelResolver.setSessionId(key, targetId);
       this.sessions.set(key, record);
+      this.deliveryRoutes.remember(targetId, replyTarget);
       await this.rememberVisibleSessions(key, [targetId]);
       if (previous && previous.agent !== agent) {
         previous.agent.cancel({ kind: 'user' });
@@ -699,6 +705,7 @@ export class SessionManager {
       await this.rememberVisibleSessions(key, [existing.sessionId]);
       existing.replyTarget = replyTarget;
       existing.lastActivity = Date.now();
+      this.deliveryRoutes.remember(existing.sessionId, replyTarget);
       return existing;
     }
 
@@ -762,6 +769,7 @@ export class SessionManager {
     };
 
     this.sessions.set(key, record);
+    this.deliveryRoutes.remember(sessionId, replyTarget);
     await this.rememberVisibleSessions(key, [sessionId]);
     return record;
   }
@@ -771,6 +779,14 @@ export class SessionManager {
       if (record.sessionId === sessionId) return record;
     }
     return undefined;
+  }
+
+  getScheduledReplyTarget(sessionId: string): ReplyTarget | undefined {
+    return this.deliveryRoutes.get(sessionId);
+  }
+
+  recordScheduledDelivery(receipt: DeliveryReceipt): void {
+    this.deliveryRoutes.record(receipt);
   }
 
   findByAgent(agent: DshAgent): SessionRecord | undefined {
