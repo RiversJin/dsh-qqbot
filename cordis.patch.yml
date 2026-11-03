@@ -18,6 +18,9 @@
         appSecret: __FROM_ENV__
         # provider/model 留空：从宿主默认模型路由继承
         # 用户可通过 /model 命令在聊天中切换
+        # 快捷切换（/model <name>；model 可写 provider/model、model id 或显示名）：
+        # modelShortcuts:
+        #   - { name: flash, model: deepseek-official/deepseek-flash, effort: high }
         requireMention: true
         textChunkLimit: 4500
         sessionIdleTimeout: 1800000

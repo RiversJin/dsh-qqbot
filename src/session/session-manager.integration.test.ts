@@ -151,17 +151,32 @@ describe('QQ session management against V4 sessions', () => {
     expect(await f.manager.compact('c2c', 'test-peer')).toEqual({ ok: false, reason: 'unavailable' });
   });
 
-  it('model switching creates only the intended child with the full inherited prefix', async () => {
+  it('switches the model in place through the Session Controller without forking', async () => {
     const f = fixture();
     const record = await f.manager.getOrCreate('c2c', 'test-peer', 'sender', { scope: 'c2c', targetId: 'test-peer' });
     turn(record.agent.session, 1, 'preserve this');
-    const count = f.logs.get(record.sessionId)!.length;
-    const route = { provider: 'test', model: 'new' };
-    await f.manager.setModelOverride('c2c', 'test-peer', route);
+    const id = record.sessionId, agent = record.agent;
+    const result = await f.manager.selectModel('c2c', 'test-peer', { provider: 'test', model: 'web-choice', reasoningEffort: 'high' });
+    expect(result).toEqual({ ok: true, route: f.route, busy: false });
+    expect(f.ctx.sessionController.selectModel).toHaveBeenCalledWith({
+      sessionId: id, provider: 'test', model: 'web-choice', reasoningEffort: 'high',
+    });
+    expect(record.sessionId).toBe(id);
+    expect(record.agent).toBe(agent);
+    expect(f.agents.create).toHaveBeenCalledTimes(1);
     expect(f.services.sessions.fork).not.toHaveBeenCalled();
-    expect(f.agents.create).toHaveBeenCalledTimes(2);
-    expect(record.agent.session.inheritedEventCount).toBe(count);
-    expect(record.agent.session.deriveMessages()).toHaveLength(2);
-    expect(f.agents.create.mock.calls[1]![0].agentOptions).toEqual(route);
+    expect(f.logs.get(id)!.at(-1)?.type).toBe('model/selection');
+    expect(f.manager.getEffectiveModel('c2c', 'test-peer')).toEqual(f.route);
+  });
+
+  it('reports controller rejection and no-session without touching the session', async () => {
+    const f = fixture();
+    expect(await f.manager.selectModel('c2c', 'test-peer', { provider: 'test', model: 'x' })).toEqual({ ok: false, reason: 'no-session' });
+    const record = await f.manager.getOrCreate('c2c', 'test-peer', 'sender', { scope: 'c2c', targetId: 'test-peer' });
+    f.ctx.sessionController.selectModel.mockRejectedValueOnce(new Error('Select an available model before sending a message.'));
+    expect(await f.manager.selectModel('c2c', 'test-peer', { provider: 'test', model: 'gone' })).toEqual({
+      ok: false, reason: 'failed', message: 'Select an available model before sending a message.',
+    });
+    expect(f.manager.getSessionRecord('c2c', 'test-peer')).toBe(record);
   });
 });

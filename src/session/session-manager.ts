@@ -13,10 +13,10 @@
  * 挂载 preset（工具集、prompt sections 等），实现场景化配置。
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { SessionId, SessionSeq, SessionLogOffset, buildForkSeed, deriveEventMessage, type SessionEvent } from '@deepseek-ai/dsh-session';
+import { SessionId, deriveEventMessage, type SessionEvent } from '@deepseek-ai/dsh-session';
 import type {} from '@deepseek-ai/dsh-session-query';
 import type {} from '@deepseek-ai/dsh-commands';
-import type {} from '@deepseek-ai/dsh-api-session-controller';
+import type { ModelCatalog } from '@deepseek-ai/dsh-api-session-controller';
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { emptySummary, foldQqSummary, type QqSessionSummary } from './projection.js';
 import type { Context } from '@deepseek-ai/cordis';
@@ -30,7 +30,6 @@ import type {
   SessionEventLike,
   DshAgent,
   DshAgentHandle,
-  SessionsService,
   DshAgentRegistry,
   AgentPresetsLike,
   PresetComposition,
@@ -77,17 +76,6 @@ export class SessionManager {
         void record.handle.dispose().catch(() => {});
       },
     );
-  }
-
-  /**
-   * 动态获取 sessions 服务（fork 能力，可选）
-   */
-  private getSessionsService(): SessionsService | undefined {
-    try {
-      return this.ctx.get('sessions') as SessionsService | undefined;
-    } catch {
-      return undefined;
-    }
   }
 
   private async readEvents(sessionId: string): Promise<readonly SessionEvent[]> {
@@ -298,82 +286,58 @@ export class SessionManager {
     const key = this.sessionKey(scope, peerId);
     const fallback = this.modelResolver.getEffectiveRoute(key);
     const record = this.sessions.get(key);
-    return record
-      ? selectSessionModelRoute(undefined, sessionRequestRoute(record.agent), fallback)
-      : fallback;
+    if (!record) return fallback;
+    const selection = this.ctx.sessionProjections.stateOf(record.agent.session, 'modelSelection');
+    return selectSessionModelRoute(
+      normalizeModelRoute(selection?.pending ?? selection?.lastUsed),
+      sessionRequestRoute(record.agent),
+      fallback,
+    );
   }
 
   /**
-   * 切换模型（fork + 重建，对齐 dsh-TUI 的 switchModel）
+   * Switch the model of the peer's current session in place.
+   *
+   * Goes through the same Session Controller method as the Web model picker:
+   * a durable `model/selection` event applied to the next request, keeping the
+   * session id, history, projections and anchors unchanged. The peer default is
+   * updated too, so `/new` starts on the same model.
    */
-  async setModelOverride(scope: ChatScope, peerId: string, route: ModelRoute): Promise<void> {
+  async selectModel(
+    scope: ChatScope,
+    peerId: string,
+    route: ModelRoute,
+  ): Promise<
+    | { ok: true; route: ModelRoute; busy: boolean }
+    | { ok: false; reason: 'no-session' | 'failed'; message?: string }
+  > {
     const key = this.sessionKey(scope, peerId);
-
-    this.modelResolver.setOverride(key, route);
-
     const record = this.sessions.get(key);
-    if (!record) {
-      this.logger.info(`model pref saved (no active session): key=${key} → ${route.provider}/${route.model}`);
-      return;
-    }
-
-    const sessionsService = this.getSessionsService();
-    if (!sessionsService) {
-      this.logger.warn(`fork unavailable, fallback to dispose: key=${key}`);
-      this.sessions.delete(key);
-      record.agent.cancel({ kind: 'user' });
-      await record.handle.dispose().catch(() => {});
-      return;
-    }
-
-    let seed: readonly SessionEvent[];
-    let inheritedEventCount: number;
+    if (!record) return { ok: false, reason: 'no-session' };
+    let selected: ModelRoute | undefined;
     try {
-      const source = await this.readEvents(record.sessionId);
-      inheritedEventCount = source.length;
-      seed = source.length === 0 ? [] : buildForkSeed(source, SessionSeq(source.length - 1));
+      const value = await this.ctx.sessionController.selectModel({
+        sessionId: SessionId(record.sessionId),
+        provider: route.provider,
+        model: route.model,
+        ...(route.reasoningEffort ? { reasoningEffort: route.reasoningEffort } : {}),
+      });
+      selected = normalizeModelRoute(value.selected);
     } catch (err) {
-      this.logger.warn(`fork failed, fallback to dispose: key=${key} err=${err instanceof Error ? err.message : String(err)}`);
-      this.sessions.delete(key);
-      record.agent.cancel({ kind: 'user' });
-      await record.handle.dispose().catch(() => {});
-      return;
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.warn(`model select failed: key=${key} sessionId=${record.sessionId} → ${route.provider}/${route.model} err=${message}`);
+      return { ok: false, reason: 'failed', message };
     }
-
-    const parentId = record.sessionId;
-    const childId = SessionId(randomUUID());
-
-    const composed = await this.composePreset(this.config.preset);
-    const created = await this.agents.create({
-      sessionId: childId,
-      seed,
-      inheritedEventCount: SessionLogOffset(inheritedEventCount),
-      meta: {
-        cwd: this.config.cwd || process.cwd(),
-        parentSession: SessionId(record.sessionId),
-        isSeeded: true,
-        ...(composed.agentPreset ? { agentPreset: composed.agentPreset } : {}),
-      },
-      agentOptions: agentOptionsFor(route),
-      ...(composed.setup ? { setup: composed.setup } : {}),
-    });
-
-    this.applyConfiguredPermission(created.agent);
-    await this.attachConfiguredWorkspace(created.agent);
-
-    this.modelResolver.setSessionId(key, childId);
-
-    const oldHandle = record.handle;
-    record.sessionId = childId;
-    record.agent = created.agent;
-    record.handle = created;
-    record.agentPreset = composed.agentPreset;
+    const accepted = selected ?? route;
+    this.modelResolver.setOverride(key, accepted);
     record.lastActivity = Date.now();
+    this.logger.info(`model selected in place: key=${key} sessionId=${record.sessionId} → ${accepted.provider}/${accepted.model}${accepted.reasoningEffort ? `@${accepted.reasoningEffort}` : ''}`);
+    return { ok: true, route: accepted, busy: record.agent.status !== 'idle' };
+  }
 
-    this.deliveryRoutes.remember(childId, record.replyTarget);
-    void oldHandle.dispose().catch(() => {});
-    await this.rememberVisibleSessions(key, [parentId, childId]);
-    this.logger.info(`model switched via fork: key=${key} → ${route.provider}/${route.model} sessionId=${childId}`);
+  /** Host model catalog (provider groups with reasoning efforts), as shown by the Web picker. */
+  async modelCatalog(): Promise<ModelCatalog> {
+    return this.ctx.sessionController.modelCatalog();
   }
 
   /** Execute the shared native retry command on the existing QQ session. */

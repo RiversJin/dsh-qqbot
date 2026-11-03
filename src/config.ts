@@ -40,6 +40,15 @@ export interface VisionConfig {
   timeoutMs: number;
 }
 
+export interface ModelShortcut {
+  /** 快捷名，/model <name> 切换 */
+  name: string;
+  /** 目标模型：provider/model、裸 model id 或显示名 */
+  model: string;
+  /** 推理档位（可选，缺省沿用当前档位或模型默认） */
+  effort?: string;
+}
+
 export interface ImQQBotConfig {
   /** QQ Bot AppID */
   appId: string;
@@ -49,6 +58,8 @@ export interface ImQQBotConfig {
   provider?: string;
   /** 模型名称 */
   model?: string;
+  /** /model 快捷切换列表 */
+  modelShortcuts: ModelShortcut[];
   /** Agent preset id */
   preset?: string;
   /** QQ 会话强制使用的权限预设 */
@@ -98,6 +109,11 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
   appSecret: Schema.string().default('').description('QQ Bot AppSecret'),
   provider: Schema.string().description('LLM provider name'),
   model: Schema.string().description('Model name'),
+  modelShortcuts: Schema.array(Schema.object({
+    name: Schema.string().required().description('快捷名（/model <name>）'),
+    model: Schema.string().required().description('provider/model、model id 或显示名'),
+    effort: Schema.string().description('推理档位'),
+  })).default([]).description('/model 快捷切换列表'),
   preset: Schema.string().description('Agent preset id'),
   permissionPreset: Schema.string().description('Permission preset forced onto QQ sessions'),
   workspacePath: Schema.string().description('Workspace path that owns QQ sessions'),
